@@ -26,15 +26,16 @@ The codebase contains three different subfolders, each of which has its own READ
 
 - `gradients` - codebase for computing fisher information - this is required to be able to quantize a new model
 - `quant` - codebase for running simulated quantization + eval experiments (need to first compute fisher information)
-- `deployment` - **To be released soon** - codebase for running efficient inference with compressed vectors (need to first get quantizers from quant step)
+- `deployment` - codebase for running efficient inference with compressed vectors (need to first get quantizers from quant step)
 
 To reproduce the perplexity numbers reported in the paper, run `gradients` and then `quant`.
 
 ---
 
 ### Roadmap:
+- ~~add deployment code~~
 - multi-GPU evaluation environment for long sequence length evaluation with simulated quantization
-- add deployment code
+- unify environments to simplify installation
 - optimized kernels for A100
 - additional evaluation on long context lengths + different downstream tasks
 - multi-GPU inference
