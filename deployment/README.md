@@ -21,6 +21,7 @@ pip install -e .
 cd kvquant
 python setup_cuda.py install
 cd ..
+pip install flash-attn==2.5.5 --no-build-isolation
 ```
 
 3. Run kernel benchmarking

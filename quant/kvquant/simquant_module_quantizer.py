@@ -31,13 +31,16 @@ def get_outliers(
     w,
     channel=-1,
     outlier_threshold_upper=-1,
-    outlier_threshold_lower=-1
+    outlier_threshold_lower=-1,
+    cap_outliers=-1,
+    first_few_fp16=-1
 ):
     """
     w: weight/act values (1d vector)
     channel: which dimension to share scaling factors along
     outlier_threshold_upper: upper outlier thresholds
     outlier_threshold_lower: lower outlier thresholds
+    first_few_fp16: number of initial tokens to keep in fp16
 
     Detect outliers above upper threshold / below lower threshold
     """
@@ -49,17 +52,42 @@ def get_outliers(
     above_upper = w > outlier_threshold_upper
 
     outlier_mask = torch.logical_or(under_lower, above_upper)
+
+    if cap_outliers > -1:
+        outlier_mask_tmp = outlier_mask.clone()
+
+        zero_point = (outlier_threshold_upper + outlier_threshold_lower) / 2
+        distance = (outlier_threshold_upper - outlier_threshold_lower) / 2
+        outliers = w * outlier_mask
+
+        values = torch.zeros_like(outliers)
+        values[outlier_mask] = ((w - zero_point) / distance)[outlier_mask]
+
+        upper_values, upper_indices = torch.topk(values, 21, dim=-1)
+        lower_values, lower_indices = torch.topk(values, 21, dim=-1, largest=False)
+        indices_combined = torch.cat((upper_indices, lower_indices), dim=-1)
+        values_combined = torch.cat((upper_values, lower_values), dim=-1)
+
+        values2 = torch.zeros_like(outliers)
+        values2.scatter_(-1, indices_combined, values_combined)
+        outlier_mask = values2 != 0
+
+    if first_few_fp16 > -1:
+        outlier_mask[:first_few_fp16,:] = True
+
     return outlier_mask
 
 def get_outliers_dynamic(
     w,
     channel=-1,
-    thresh=0.999
+    thresh=0.999,
+    first_few_fp16=-1
 ):
     """
     w: weight/act values (1d vector)
     channel: which dimension to share scaling factors along
     thresh: percentile for outlier threshold computation
+    first_few_fp16: number of initial tokens to keep in fp16
 
     Detect outliers above upper threshold / below lower threshold
     """
@@ -78,6 +106,10 @@ def get_outliers_dynamic(
     above_upper = w >= outlier_threshold_upper
 
     outlier_mask = torch.logical_or(under_lower, above_upper)
+
+    if first_few_fp16 > -1:
+        outlier_mask[:first_few_fp16,:] = True
+
     return outlier_mask
 
 # integer quantization function
@@ -90,6 +122,7 @@ def quant_fn_zp(
     outlier_mask=None,
     maxval=-1,
     minval=-1,
+    clamp=False
 ):
     """
     inp: weight/act values (2d matrix)
@@ -100,6 +133,7 @@ def quant_fn_zp(
     outlier_mask: positions of outlier values
     maxval: upper outlier thresholds (if not dynamically computed)
     minval: lower outlier thresholds (if not dynamically computed)
+    clamp: whether to round and clamp the zeropoint
 
     Performs simulated integer quantization
     """
@@ -125,8 +159,11 @@ def quant_fn_zp(
     qx = (2**bits - 1) / rangeval
 
     # set offset
-    offset = torch.round(minval * qx)
-    offset = offset.clamp(-(2**bits - 1), 0)
+    if clamp:
+        offset = torch.round(minval * qx)
+        offset = offset.clamp(-(2**bits - 1), 0)
+    else: # improves accuracy with per-channel key quantization
+        offset = minval * qx
 
     offset = offset.unsqueeze(qchannel)
     qx = qx.unsqueeze(qchannel)
@@ -237,7 +274,8 @@ def quant_fn_nuq_recon(
     lut=None,
     norm=False,
     normscale=None,
-    normoffset=None
+    normoffset=None,
+    first_few_fp16=-1
 ):
     """
     inp: weight/act values (2d matrix)
@@ -252,9 +290,13 @@ def quant_fn_nuq_recon(
     norm: whether to use Q-Norm
     normscale: scaling for Q-Norm
     normoffset: shift for Q-Norm
+    first_few_fp16: number of initial tokens to keep in fp16
 
     Performs simulated NUQ quantization
     """
+
+    if first_few_fp16 > -1:
+        orig = inp
 
     # set quantization threshold dynamically
     if dynamicquantization:
@@ -311,6 +353,11 @@ def quant_fn_nuq_recon(
     qinp_out = qinp_out + offset
     qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0) #TODO: debug (shouldn't be necessary)
 
+    # leave first few in fp16
+    # leave this here for now -> avoids any small perturbations from rescaling
+    if first_few_fp16 > -1:
+        qinp_out[:first_few_fp16,:] = orig[:first_few_fp16,:]
+
     return qinp_out.float()
 
 # simquant quantizer (calibration)
@@ -356,7 +403,9 @@ class SimQuant:
         sparsity_threshold=0.999,
         nuq=False,
         fisher=False,
-        norm=False
+        norm=False,
+        cap_outliers=False,
+        first_few_fp16=-1
     ):
 
         # for now, just update threshold here
@@ -367,6 +416,50 @@ class SimQuant:
 
         #TODO - if not using sparsity, use a different threshold for min-max quant?
         data = self.out.float().cpu().numpy()
+
+
+        if self.perchannel and cap_outliers:
+            #per-channel - remove tokenwise outliers and normalize range to [-1,1]
+            data = torch.tensor(data)
+
+            outlier_threshold_upper = torch.tensor(np.percentile(data, t*100, axis=self.qchannel)).unsqueeze(self.qchannel)
+            outlier_threshold_lower = torch.tensor(np.percentile(data, (1-t)*100, axis=self.qchannel)).unsqueeze(self.qchannel)
+            zero_point = (outlier_threshold_upper + outlier_threshold_lower) / 2
+            distance = (outlier_threshold_upper - outlier_threshold_lower) / 2
+            data2 = ((data - zero_point) / distance).abs()
+
+            outlier_mask = torch.zeros_like(data2, dtype=torch.bool)
+            hidden_dim = data.shape[-1]
+            num_elems = math.ceil((1-t) * hidden_dim)
+            upper_indices = torch.topk(data2, num_elems).indices
+            lower_indices = torch.topk(data2, num_elems, largest=False).indices
+
+            true_mask = torch.ones_like(upper_indices, dtype=torch.bool)
+            outlier_mask.scatter_(-1, lower_indices, true_mask)
+            outlier_mask.scatter_(-1, upper_indices, true_mask)
+
+            if first_few_fp16 > -1 :
+                # remove first few tokens
+                for i in range(0,self.nsamples):
+                    start = i*2048
+                    end = i*2048 + first_few_fp16
+                    outlier_mask[start:end,:] = True
+
+            med = torch.median(data, dim=0).values.unsqueeze(0).repeat(32768,1)
+            data_trimmed = data.clone()
+            data_trimmed[outlier_mask] = med[outlier_mask] 
+
+            outlier_threshold_upper = torch.max(data_trimmed, axis=self.qchannel).values
+            outlier_threshold_lower = torch.min(data_trimmed, axis=self.qchannel).values
+
+            # recomputing outlier mask here before doing k-means fitting
+            zero_point = (outlier_threshold_upper + outlier_threshold_lower) / 2
+            distance = (outlier_threshold_upper - outlier_threshold_lower) / 2
+            zero_point = zero_point.unsqueeze(0)
+            distance = distance.unsqueeze(0)
+            data_shifted_normalized = ((data - zero_point) / distance).abs()
+            outlier_mask = torch.logical_or((data_shifted_normalized > 1), (data_shifted_normalized < -1))
+
         if self.perchannel:
             #per-channel - remove tokenwise outliers and normalize range to [-1,1]
             outlier_threshold_upper = np.percentile(data, t*100, axis=self.qchannel)
@@ -391,7 +484,15 @@ class SimQuant:
         data_shifted_normalized = data_shifted / rangeval
 
         #get outliers (need to mask out for kmeans)
-        outlier_mask = torch.logical_or((data_shifted_normalized > 1), (data_shifted_normalized < -1))
+        if not cap_outliers:
+            outlier_mask = torch.logical_or((data_shifted_normalized > 1), (data_shifted_normalized < -1))
+
+        # remove first few tokens
+        if first_few_fp16 > -1:
+            for i in range(0,self.nsamples):
+                start = i*2048
+                end = i*2048 + first_few_fp16
+                outlier_mask[start:end,:] = True
 
         if nuq:
             centroids = []
@@ -475,7 +576,10 @@ class QuantLinearSim(nn.Module):
                     dynamicquantization=False,
                     nuq=False,
                     nf_nuq=True,
-                    norm=False
+                    norm=False,
+                    first_few_fp16=-1,
+                    cap_outliers=-1,
+                    clamp=False
                 ):
 
         super().__init__()
@@ -494,6 +598,7 @@ class QuantLinearSim(nn.Module):
 
         self.perchannel = perchannel
         self.dynamicquantization = dynamicquantization
+        self.clamp = clamp
 
         if perchannel:
             self.qchannel = 0
@@ -522,6 +627,9 @@ class QuantLinearSim(nn.Module):
             self.norm = False
             self.normscale = None
             self.normoffset = None
+
+        self.cap_outliers = cap_outliers
+        self.first_few_fp16 = first_few_fp16
 
         # for normalfloat support - compute NF signposts
         if self.nf_nuq:
@@ -610,7 +718,8 @@ class QuantLinearSim(nn.Module):
                 outlier_mask = get_outliers_dynamic(
                     y,
                     channel=self.ochannel,
-                    thresh=self.sparsity_threshold
+                    thresh=self.sparsity_threshold,
+                    first_few_fp16=self.first_few_fp16
                 )
             else:
                 self.outlier_threshold_upper = self.outlier_threshold_upper.to(y.device)
@@ -619,7 +728,9 @@ class QuantLinearSim(nn.Module):
                     y,
                     channel=self.ochannel,
                     outlier_threshold_upper=self.outlier_threshold_upper,
-                    outlier_threshold_lower=self.outlier_threshold_lower
+                    outlier_threshold_lower=self.outlier_threshold_lower,
+                    cap_outliers=self.cap_outliers,
+                    first_few_fp16=self.first_few_fp16
                 )
         else:
             outlier_mask = None
@@ -651,7 +762,8 @@ class QuantLinearSim(nn.Module):
                     lut=self.lut,
                     norm=self.norm,
                     normscale=self.normscale,
-                    normoffset=self.normoffset
+                    normoffset=self.normoffset,
+                    first_few_fp16=self.first_few_fp16
                 )
 
         else:
@@ -664,7 +776,8 @@ class QuantLinearSim(nn.Module):
                 minval=self.outlier_threshold_lower,
                 include_sparse=self.include_sparse,
                 outlier_mask=outlier_mask,
-                dynamicquantization=self.dynamicquantization
+                dynamicquantization=self.dynamicquantization,
+                clamp=self.clamp
             )
 
         self.weight = self.weight.cpu()
@@ -688,7 +801,10 @@ def make_quant_sim(
                     dynamicquantization=False,
                     nuq=False,
                     nf_nuq=True,
-                    norm=False
+                    norm=False,
+                    cap_outliers=-1,
+                    first_few_fp16=-1,
+                    clamp=False
                   ):
     if isinstance(module, QuantLinearSim):
         return
@@ -711,7 +827,10 @@ def make_quant_sim(
                                                     dynamicquantization=dynamicquantization,
                                                     nuq=nuq,
                                                     nf_nuq=nf_nuq,
-                                                    norm=norm
+                                                    norm=norm,
+                                                    cap_outliers=cap_outliers,
+                                                    first_few_fp16=first_few_fp16,
+                                                    clamp=clamp
                                                 ))
         del tmp
     for name1, child in module.named_children():
@@ -726,5 +845,8 @@ def make_quant_sim(
                         dynamicquantization=dynamicquantization,
                         nuq=nuq,
                         nf_nuq=nf_nuq,
-                        norm=norm
+                        norm=norm,
+                        cap_outliers=cap_outliers,
+                        first_few_fp16=first_few_fp16,
+                        clamp=clamp
                       )

@@ -136,6 +136,12 @@ class LlamaConfig(PretrainedConfig):
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
+        dynamicrope=True,
+        use_orig_sparse=False,
+        first_few_fp16=0,
+        maxseqlen=-1,
+        abits=4,
+        include_sparse=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -160,6 +166,14 @@ class LlamaConfig(PretrainedConfig):
         self._rope_scaling_validation()
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+
+        # arguments for KVQuant
+        self.dynamicrope = dynamicrope
+        self.use_orig_sparse = use_orig_sparse
+        self.first_few_fp16 = first_few_fp16
+        self.maxseqlen = maxseqlen
+        self.abits = abits
+        self.include_sparse = include_sparse
 
         super().__init__(
             pad_token_id=pad_token_id,

@@ -151,7 +151,7 @@ for l in range(0,32):
     for i in range(0,N):
         newk = k_act[i]
 
-        rows2, cols2, vals2, start_rows, num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparse(
+        rows2, cols2, vals2, start_rows, num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparseorig(
             kcache2,
             lookup_table,
             newk,
@@ -185,7 +185,7 @@ for l in range(0,32):
 # warmup
 j = 0
 for i in range(0,num_iters):
-    quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2(
+    quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_orig(
         d[f'layer{j} q'],
         d[f'layer{j} kcache2'],
         d[f'layer{j} mul'],
@@ -197,7 +197,9 @@ for i in range(0,num_iters):
         d[f'layer{j} vals2'],
         d[f'layer{j} N'],
         d[f'layer{j} num_threads'],
-        d[f'layer{j} num_nonzeros']
+        d[f'layer{j} num_nonzeros'],
+        10000, # rope theta
+        0 # pos offset (for first few tokens in fp16)
     )
 
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -209,7 +211,7 @@ activities=[
 ) as p:
     for j in range(0,32):
         for i in range(0,num_iters):
-            quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2(
+            quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_orig(
                 d[f'layer{j} q'],
                 d[f'layer{j} kcache2'],
                 d[f'layer{j} mul'],
@@ -221,6 +223,8 @@ activities=[
                 d[f'layer{j} vals2'],
                 d[f'layer{j} N'],
                 d[f'layer{j} num_threads'],
-                d[f'layer{j} num_nonzeros']
+                d[f'layer{j} num_nonzeros'],
+                10000, # rope theta
+                0 # pos offset (for first few tokens in fp16)
             )
 print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))

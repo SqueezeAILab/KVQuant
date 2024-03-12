@@ -89,7 +89,7 @@ def main():
     parser.add_argument("--path_to_output_dir", type=str, default="results/passkey")
     parser.add_argument("--simquant",  action='store_true')
     parser.add_argument("--abits", type=int, default=16)
-    parser.add_argument("--quantizer_path", type=str, default=None, help='quantizer path')
+    parser.add_argument("--quantizer-path", type=str, default=None, help='quantizer path')
     parser.add_argument("--norm",  action='store_true')
     args = parser.parse_args()
 

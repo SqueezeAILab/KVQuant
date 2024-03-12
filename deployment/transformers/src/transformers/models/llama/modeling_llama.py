@@ -156,6 +156,26 @@ class LlamaRotaryEmbedding(nn.Module):
             self.sin_cached[:seq_len].to(dtype=x.dtype),
         )
 
+class LlamaRotaryEmbeddingDynamic(nn.Module):
+    def __init__(self, dim, base=10000, device=None):
+        super().__init__() # don't use baseline LlamaRotaryEmbedding as base class to avoid instantiating cached sin/cos
+
+        self.dim = dim
+        self.base = base
+        self.device = device
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x, start_pos, end_pos):
+        t = torch.arange(start_pos, end_pos, device=self.device, dtype=torch.int64).type_as(self.inv_freq)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        cos_ret = emb.cos().to(x.dtype)
+        sin_ret = emb.sin().to(x.dtype)
+
+        return (cos_ret,sin_ret)
+
 
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
@@ -245,6 +265,14 @@ def apply_rotary_pos_emb_query(q, cos, sin, position_ids, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     return q_embed
 
+# apply RoPE to only Q here using dynamic RoPE cos/sin computation
+def apply_rotary_pos_emb_query_dynamic(q, cos, sin, position_ids, unsqueeze_dim=1):
+    position_ids = position_ids.cpu()
+    # cos = cos.unsqueeze(unsqueeze_dim)
+    # sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    return q_embed
+
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -324,7 +352,7 @@ def compute_lut(
 
 # class to manage the key cache
 class QuantK(nn.Module):
-    def __init__(self, bits=4, hidden_size=4096, num_heads=32, max_position_embeddings=-1, include_sparse=False, sparsity_threshold=0.99):
+    def __init__(self, bits=2, hidden_size=4096, num_heads=32, max_position_embeddings=-1, include_sparse=False, sparsity_threshold=0.99, rope_theta=10000, use_orig_sparse=False, first_few_fp16=0):
 
         """
         bits: number of bits for quantization
@@ -333,6 +361,9 @@ class QuantK(nn.Module):
         max_position_embeddings: max sequence length
         include_sparse: whether to isolate outliers
         sparsity_threshold: what percentage of outliers to remove
+        rope_theta: theta for RoPE embeddings
+        use_orig_sparse: whether to use original sparse kernels for keys (without capping outlier percentage)
+        first_few_fp16: how many initial tokens to store in fp16
 
         This class manages the compressed key cache during generation
         """
@@ -355,23 +386,62 @@ class QuantK(nn.Module):
         self.include_sparse = include_sparse
         self.outlier_threshold_upper = None
         self.outlier_threshold_lower = None
-        self.rows = torch.tensor([]).cuda()
-        self.cols = torch.tensor([]).cuda()
-        self.vals = torch.tensor([]).cuda()
-        self.start_rows = torch.tensor([]).cuda()
         self.num_threads = -1
 
         # KV cache parameters
         self.max_len = max_position_embeddings
         self.klen = 0
-        self.kcache = torch.zeros((self.num_heads, self.head_dim // 8, self.max_len), dtype=torch.int).cuda()
+        self.kcache = torch.zeros((self.num_heads, (self.head_dim // 32) * self.bits, self.max_len), dtype=torch.int).cuda()
+
+        # outlier params
+        if self.include_sparse:
+            self.outliers = torch.zeros((self.max_len,42), dtype=torch.float).cuda()
+            self.outlier_indices = torch.zeros((self.max_len,42), dtype=torch.int).cuda()
+
+        # For LWM - rope theta
+        self.rope_theta = rope_theta
+
+        # dense-and-sparse quantization parameters for original code
+        self.rows = torch.tensor([]).cuda()
+        self.cols = torch.tensor([]).cuda()
+        self.vals = torch.tensor([]).cuda()
+        self.start_rows = torch.tensor([]).cuda()
+        self.num_threads = -1
+        self.use_orig_sparse = use_orig_sparse
+
+        # first few in fp16
+        self.first_few_fp16 = first_few_fp16
+
+        # Q-Norm
+        self.norm = False
+
+    def reset(self):
+        """
+        This class resets the compressed key cache
+        """
+        self.klen = 0
+        self.kcache[self.kcache!=0] = 0
+
+        if self.include_sparse:
+            if self.use_orig_sparse:
+                # dense-and-sparse quantization parameters for original code
+                self.rows = torch.tensor([]).cuda()
+                self.cols = torch.tensor([]).cuda()
+                self.vals = torch.tensor([]).cuda()
+                self.start_rows = torch.tensor([]).cuda()
+                self.num_threads = -1
+
+            else:
+                self.outliers[self.outliers!=0] = 0
+                self.outlier_indices[self.outlier_indices!=0] = 0
 
     # Initial function to load lookup tables
-    def load_lookup_table(self, quantizer, include_sparse = True, sparsity_threshold = 0.99): # need to load using calibration data
+    def load_lookup_table(self, quantizer, include_sparse = True, sparsity_threshold = 0.99, norm=False): # need to load using calibration data
         """
         quantizer: calibrated outlier thresholds / LUT for the current layer
         include_sparse: whether to isolate outliers
         sparsity_threshold: what percentage of outliers to remove
+        norm: whether to use Q-Norm
 
         Loads the LUT and outlier thresholds for the key cache
         """
@@ -392,6 +462,17 @@ class QuantK(nn.Module):
         offset = (maxval + minval) / 2
         rangeval = (maxval - minval) / 2
 
+        # Q-Norm
+        self.norm = norm
+        if self.norm:
+            self.normscale = quantizer[3].cuda()
+            self.normoffset = quantizer[4].cuda()
+            self.lookup_table2 = torch.zeros((self.num_heads, self.head_dim, 2 ** self.bits))
+        else:
+            self.normscale = None
+            self.normoffset = None
+            self.lookup_table2 = None
+
         # initialize per-channel LUT
         for i in range(self.num_heads):
             for j in range(self.head_dim):
@@ -400,8 +481,20 @@ class QuantK(nn.Module):
                 sf_tmp = rangeval[idx]
                 offset_tmp = offset[idx]
 
-                self.lookup_table[i,j] = torch.tensor(self.lut) * sf_tmp.item() + offset_tmp.item()
+                lut_tmp = torch.tensor(self.lut)
+                lut_tmp,_ = lut_tmp.sort()
+
+                # Q-Norm
+                if norm:
+                    lut_tmp2 = (lut_tmp * self.normscale + self.normoffset) * sf_tmp.item() + offset_tmp.item()
+                    self.lookup_table2[i,j] = lut_tmp2
+
+                lut_tmp = lut_tmp * sf_tmp.item() + offset_tmp.item()
+                self.lookup_table[i,j] = lut_tmp
+
         self.lookup_table = self.lookup_table.cuda()
+        if self.norm:
+            self.lookup_table2 = self.lookup_table2.cuda()
 
         # initialize zeropoint
         self.zeropoint = (self.outlier_threshold_upper + self.outlier_threshold_lower) / 2
@@ -409,7 +502,154 @@ class QuantK(nn.Module):
         self.outlier_threshold_upper = self.outlier_threshold_upper.float().cuda()
         self.outlier_threshold_lower = self.outlier_threshold_lower.float().cuda()
 
-        return self.lookup_table
+    # forward pass to compute Q*K^T with the compressed KV cache
+    def forward_fused_sparse_orig(self, q, k):
+        """
+        q: current query vector
+        k: key vector to append
+
+        Performs the forward pass using the compressed key cache (and also appends a new key vector)
+        This function contains the original implementation without capping the outlier percentage
+        """
+
+        assert(self.include_sparse)
+        assert(self.bits == 4) # 3-bit / 2-bit not implemented yet
+
+        k = k.flatten()
+        q = q.float()
+        q = q.transpose(0,1).contiguous()
+        k = k.float()
+
+        # sparse packing kernel
+        self.rows, self.cols, self.vals, self.start_rows, self.num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparseorig(
+            self.kcache,
+            self.lookup_table,
+            k,
+            self.zeropoint,
+            self.rows,
+            self.cols,
+            self.vals,
+            self.start_rows,
+            self.outlier_threshold_lower,
+            self.outlier_threshold_upper,
+            self.klen - self.first_few_fp16
+        )
+        self.num_threads = self.num_threads[0]
+        self.num_nonzeros = self.vals.shape[0]
+
+        self.klen += 1
+        mul = torch.zeros((q.shape[0], q.shape[1], self.klen - self.first_few_fp16), dtype=torch.float, device=q.device) #TODO: support longer q seqlens
+
+        quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2_orig(
+            q,
+            self.kcache,
+            mul,
+            self.lookup_table,
+            self.klen - self.first_few_fp16,
+            self.rows,
+            self.cols,
+            self.start_rows,
+            self.vals,
+            self.klen - self.first_few_fp16,
+            self.num_threads,
+            self.num_nonzeros,
+            self.rope_theta,
+            self.first_few_fp16
+        )
+
+        mul = mul.transpose(0,1).contiguous()
+        mul = mul.half()
+        return mul
+
+    # forward pass to compute Q*K^T with the compressed KV cache
+    def parallel_pack_orig(self, k):
+        """
+        k: key vectors to append
+
+        Pack several key vectors in parallel
+        This function contains the original implementation without capping the outlier percentage
+        """
+
+        assert(self.include_sparse)
+        assert(self.bits == 4) # 3-bit / 2-bit not implemented yet
+
+        k = k.float().contiguous()
+
+        # update klen
+        self.klen += k.shape[-1]
+
+        # sparse packing kernel
+        if self.include_sparse:
+            outliers_rescaled = k.clone()
+
+            if self.bits == 4:
+                quant_cuda.vecquant4appendvecKsparseParallel(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    outliers_rescaled,
+                    self.outlier_threshold_lower,
+                    self.outlier_threshold_upper,
+                )
+
+            else:
+                # 4-bit / 3-bit aren't implemented yet
+                assert (False)
+
+            # detect outliers
+            k = k.reshape(-1,k.shape[-1])
+            k_outliers_lower = (k < self.outlier_threshold_lower.unsqueeze(-1))
+            k_outliers_above = (k > self.outlier_threshold_upper.unsqueeze(-1))
+
+            # subtract high / low LUT values
+            numvals = 2 ** self.bits
+            lut = self.lookup_table.reshape(-1,self.lookup_table.shape[-1])
+            lut_lower = lut[:,0].unsqueeze(-1)
+            lut_upper = lut[:,numvals-1].unsqueeze(-1)
+
+            # subtract nearest values
+            k1 = k - lut_lower
+            k2 = k - lut_upper
+            k[k_outliers_lower] = k1[k_outliers_lower]
+            k[k_outliers_above] = k2[k_outliers_above]
+
+            # zero out non-outliers
+            k_outliers = torch.logical_or(k_outliers_above, k_outliers_lower)
+            k_not_outliers = ~k_outliers
+            k[k_not_outliers] = 0
+
+            # pack as CSR
+            csr_mat = k.t().contiguous().to_sparse_csr()
+
+            # extract rows, cols, vals
+            self.rows = csr_mat.crow_indices().int()
+            self.cols = csr_mat.col_indices().int()
+            self.vals = csr_mat.values().float()
+
+            # initialize start_rows / num_threads
+            if len(self.vals) > 0:
+
+                self.num_threads = int((self.vals.shape[0]+9) / 10)
+                nnz_per_thread = 10
+                self.num_nonzeros = self.vals.shape[0]
+
+                # create start_rows (all -1)
+                num_threads_tmp = int((self.num_threads + 127) / 128) * 128 # 128 is blocksize
+                self.start_rows = -torch.ones((num_threads_tmp,)).int().cuda()
+
+                # need to initialize multiple starting rows
+                j = 0
+                for i in range(len(self.rows) - 1):
+                    start = self.rows[i]
+                    end = self.rows[i+1]
+
+                    while (j*10 < end):
+                        self.start_rows[j] = i
+                        j += 1
+
+        else:
+            assert (False)
+
 
     # forward pass to compute Q*K^T with the compressed KV cache
     def forward_fused_sparse(self, q, k):
@@ -427,63 +667,318 @@ class QuantK(nn.Module):
 
         # sparse packing kernel
         if self.include_sparse:
-            self.rows, self.cols, self.vals, self.start_rows, self.num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparse(
-                self.kcache,
-                self.lookup_table,
-                k,
-                self.zeropoint,
-                self.rows,
-                self.cols,
-                self.vals,
-                self.start_rows,
-                self.outlier_threshold_lower,
-                self.outlier_threshold_upper,
-                self.klen
-            )
-            self.num_threads = self.num_threads[0]
-            self.num_nonzeros = self.vals.shape[0]
+            outliers_rescaled = k.clone()
+
+            if self.bits == 4:
+                quant_cuda.vecquant4appendvecKsparse(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    outliers_rescaled,
+                    self.outlier_threshold_lower,
+                    self.outlier_threshold_upper,
+                    self.klen - self.first_few_fp16
+                )
+
+            elif self.bits == 3:
+                quant_cuda.vecquant3appendvecKsparse(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    outliers_rescaled,
+                    self.outlier_threshold_lower,
+                    self.outlier_threshold_upper,
+                    self.klen - self.first_few_fp16
+                )
+
+            elif self.bits == 2:
+                quant_cuda.vecquant2appendvecKsparse(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    outliers_rescaled,
+                    self.outlier_threshold_lower,
+                    self.outlier_threshold_upper,
+                    self.klen - self.first_few_fp16
+                )
+
+            else:
+                assert (False)
+
+            # need to sort outliers -> which to keep (in order to have fixed size memory allocation)
+            threshold_k = int(((1-self.sparsity_threshold) / 2) * self.hidden_size) + 1 # should be 21
+            outliers_rescaled = outliers_rescaled.cpu()
+            upper_outliers_tmp,upper_outlier_indices = torch.topk(outliers_rescaled,threshold_k)
+            lower_outliers_tmp,lower_outlier_indices = torch.topk(outliers_rescaled,threshold_k,largest=False)
+            upper_outliers_tmp = upper_outliers_tmp.cuda()
+            lower_outliers_tmp = lower_outliers_tmp.cuda()
+            upper_outlier_indices = upper_outlier_indices.cuda()
+            lower_outlier_indices = lower_outlier_indices.cuda()
+
+            # get actual outlier values (from k vector)
+            upper_outliers = k[upper_outlier_indices]
+            lower_outliers = k[lower_outlier_indices]
+
+            # subtract offset -> need to subtract closest LUT element
+            numvals = 2 ** self.bits
+
+            # Q-Norm
+            if self.norm:
+                lut = self.lookup_table2.reshape(-1,numvals)
+            else:
+                lut = self.lookup_table.reshape(-1,numvals)
+
+            # subtract outliers
+            upper_outliers = upper_outliers - lut[upper_outlier_indices,numvals-1]
+            lower_outliers = lower_outliers - lut[lower_outlier_indices,0]
+
+            # make sure not storing more than needed
+            # if normalized is between -1 and 1, then it isn't an outlier
+            upper_outliers_zeros = upper_outliers_tmp <= 1
+            lower_outliers_zeros = lower_outliers_tmp >= -1
+            outlier_zeros_cat = torch.cat((upper_outliers_zeros, lower_outliers_zeros), dim=-1)
+
+            # concatenate lower / upper outliers (to be appended to arrays)
+            outlier_values_cat = torch.cat((upper_outliers, lower_outliers), dim=-1)
+            outlier_indices_cat = torch.cat((upper_outlier_indices, lower_outlier_indices), dim=-1)
+            outlier_indices,idx = outlier_indices_cat.sort()
+            outlier_vals = outlier_values_cat[idx]
+
+            # zero out ones that aren't actually outliers
+            outlier_zeros_cat = outlier_zeros_cat[idx]
+            outlier_vals[outlier_zeros_cat] = 0
+
+            # need to append to outlier cache
+            self.outliers[self.klen - self.first_few_fp16] = outlier_vals
+            self.outlier_indices[self.klen - self.first_few_fp16] = outlier_indices
+
         else:
-            quant_cuda.vecquant4appendvecK(
-                self.kcache,
-                self.lookup_table,
-                k,
-                self.klen
-            )
+            if self.bits == 4:
+                quant_cuda.vecquant4appendvecK(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    self.klen - self.first_few_fp16
+                )
+
+            elif self.bits == 3:
+                quant_cuda.vecquant3appendvecK(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    self.klen - self.first_few_fp16
+                )
+
+            elif self.bits == 2:
+                quant_cuda.vecquant2appendvecK(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    self.klen - self.first_few_fp16
+                )
+
+            else:
+                assert (False)
 
         self.klen += 1
-        mul = torch.zeros((q.shape[0], q.shape[1], self.klen), dtype=torch.float, device=q.device) #TODO: support longer q seqlens
+        mul = torch.zeros((q.shape[0], q.shape[1], self.klen - self.first_few_fp16), dtype=torch.float, device=q.device)
 
         if self.include_sparse:
-            quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2(
-                q,
-                self.kcache,
-                mul,
-                self.lookup_table,
-                self.klen,
-                self.rows,
-                self.cols,
-                self.start_rows,
-                self.vals,
-                self.klen,
-                self.num_threads,
-                self.num_nonzeros
-            )
+            if self.bits == 4:
+                quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2(
+                    q,
+                    self.kcache,
+                    mul,
+                    self.lookup_table,
+                    self.klen - self.first_few_fp16,
+                    self.outliers,
+                    self.outlier_indices,
+                    self.rope_theta,
+                    self.first_few_fp16
+                )
+
+            elif self.bits == 3:
+                quant_cuda.vecquant3matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2(
+                    q,
+                    self.kcache,
+                    mul,
+                    self.lookup_table,
+                    self.klen - self.first_few_fp16,
+                    self.outliers,
+                    self.outlier_indices,
+                    self.rope_theta,
+                    self.first_few_fp16
+                )
+
+            elif self.bits == 2:
+                if self.norm:
+                    lookup_table = self.lookup_table2
+                else:
+                    lookup_table = self.lookup_table
+
+                quant_cuda.vecquant2matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt2(
+                    q,
+                    self.kcache,
+                    mul,
+                    lookup_table, # self.lookup_table,
+                    self.klen - self.first_few_fp16,
+                    self.outliers,
+                    self.outlier_indices,
+                    self.rope_theta,
+                    self.first_few_fp16
+                )
+
+            else:
+                assert (False)
+
         else:
-            quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt(
-                q,
-                self.kcache,
-                mul,
-                self.lookup_table,
-                self.klen
-            )
+            if self.bits == 4:
+                quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt(
+                    q,
+                    self.kcache,
+                    mul,
+                    self.lookup_table,
+                    self.klen - self.first_few_fp16,
+                    self.rope_theta,
+                    self.first_few_fp16
+                )
+            elif self.bits == 3:
+                quant_cuda.vecquant3matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt(
+                    q,
+                    self.kcache,
+                    mul,
+                    self.lookup_table,
+                    self.klen - self.first_few_fp16,
+                    self.rope_theta,
+                    self.first_few_fp16
+                )
+
+            elif self.bits == 2:
+                if self.norm:
+                    lookup_table = self.lookup_table2
+                else:
+                    lookup_table = self.lookup_table
+
+                quant_cuda.vecquant2matmul_nuq_perchannel_transposed_rope_mha_batched_fused_opt(
+                    q,
+                    self.kcache,
+                    mul,
+                    lookup_table, # self.lookup_table,
+                    self.klen - self.first_few_fp16,
+                    self.rope_theta,
+                    self.first_few_fp16
+                )
+
+            else:
+                assert (False)
 
         mul = mul.transpose(0,1).contiguous()
         mul = mul.half()
+
         return mul
+
+    # parallel packing function
+    def parallel_pack(self, k):
+        """
+        k: key vectors to append
+
+        Pack several key vectors in parallel
+        """
+
+        k = k.float().contiguous()
+
+        # update klen
+        self.klen += k.shape[-1]
+
+        # sparse packing kernel
+        if self.include_sparse:
+            outliers_rescaled = k.clone()
+
+            if self.bits == 4:
+                quant_cuda.vecquant4appendvecKsparseParallel(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    outliers_rescaled,
+                    self.outlier_threshold_lower,
+                    self.outlier_threshold_upper,
+                )
+
+            elif self.bits == 3:
+                quant_cuda.vecquant3appendvecKsparseParallel(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    outliers_rescaled,
+                    self.outlier_threshold_lower,
+                    self.outlier_threshold_upper,
+                )
+
+            elif self.bits == 2:
+                quant_cuda.vecquant2appendvecKsparseParallel(
+                    self.kcache,
+                    self.lookup_table,
+                    k,
+                    outliers_rescaled,
+                    self.outlier_threshold_lower,
+                    self.outlier_threshold_upper,
+                )
+
+            else:
+                assert (False)
+
+            # reshape for topK
+            outliers_rescaled = outliers_rescaled.reshape(-1,k.shape[-1]).transpose(0,1).contiguous()
+            k = k.reshape(-1,k.shape[-1]).transpose(0,1).contiguous()
+
+            # need to sort outliers -> which to keep (in order to have fixed size memory allocation)
+            threshold_k = int(((1-self.sparsity_threshold) / 2) * self.hidden_size) + 1
+            upper_outliers_tmp,upper_outlier_indices = torch.topk(outliers_rescaled,threshold_k,dim=-1)
+            lower_outliers_tmp,lower_outlier_indices = torch.topk(outliers_rescaled,threshold_k,dim=-1,largest=False)
+
+            # get actual outlier values (from k vector)
+            upper_outliers = k[torch.arange(k.size(0)).unsqueeze(1), upper_outlier_indices]
+            lower_outliers = k[torch.arange(k.size(0)).unsqueeze(1), lower_outlier_indices]
+
+            # shift outliers by nearest LUT elements
+            numvals = 2 ** self.bits
+
+            # Q-Norm
+            if self.norm:
+                lut = self.lookup_table2.reshape(-1,numvals)
+            else:
+                lut = self.lookup_table.reshape(-1,numvals)
+
+            # subtract outliers
+            upper_outliers = upper_outliers - lut[upper_outlier_indices,numvals-1]
+            lower_outliers = lower_outliers - lut[lower_outlier_indices,0]
+
+            # make sure not storing more than needed
+            # if normalized is between -1 and 1, then it isn't an outlier
+            upper_outliers_zeros = upper_outliers_tmp <= 1
+            lower_outliers_zeros = lower_outliers_tmp >= -1
+            outlier_zeros_cat = torch.cat((upper_outliers_zeros, lower_outliers_zeros), dim=-1)
+
+            # concatenate lower / upper outliers (to be appended to arrays)
+            outlier_values_cat = torch.cat((upper_outliers, lower_outliers), dim=-1)
+            outlier_indices_cat = torch.cat((upper_outlier_indices, lower_outlier_indices), dim=-1)
+            outlier_indices,idx = outlier_indices_cat.sort(dim=-1)
+            outlier_vals = outlier_values_cat[torch.arange(outlier_values_cat.size(0)).unsqueeze(1), idx]
+
+            # zero out ones that aren't actually outliers
+            outlier_zeros_cat = outlier_zeros_cat[torch.arange(outlier_zeros_cat.size(0)).unsqueeze(1), idx]
+            outlier_vals[outlier_zeros_cat] = 0
+
+            # need to append to outlier cache
+            self.outliers[:self.klen] = outlier_vals
+            self.outlier_indices[:self.klen] = outlier_indices
+
+        else:
+            assert (False)
 
 # class for managing compressed values
 class QuantV(nn.Module):
-    def __init__(self, bits=4, hidden_size=4096, num_heads=32, max_position_embeddings=-1, include_sparse=False, sparsity_threshold=0.99):
+    def __init__(self, bits=2, hidden_size=4096, num_heads=32, max_position_embeddings=-1, include_sparse=False, sparsity_threshold=0.99, first_few_fp16=0):
         super().__init__()
 
         """
@@ -493,6 +988,7 @@ class QuantV(nn.Module):
         max_position_embeddings: max sequence length
         include_sparse: whether to isolate outliers
         sparsity_threshold: what percentage of outliers to remove
+        first_few_fp16: how many initial tokens to store in fp16
 
         This class manages the compressed value cache during generation
         """
@@ -504,51 +1000,98 @@ class QuantV(nn.Module):
 
         # quantization parameters
         self.bits = bits
-        self.lut = None # global LUT
+        self.lut = None
         self.zeropoint = None
 
         # dense-and-sparse quantization parameters
         self.sparsity_threshold = sparsity_threshold
         self.include_sparse = include_sparse
-        self.rows = torch.tensor([]).cuda()
-        self.cols = torch.tensor([]).cuda()
-        self.vals = torch.tensor([]).cuda()
-        self.start_cols = torch.tensor([]).cuda()
         self.num_threads = -1
 
         # KV cache parameters
         self.max_len = max_position_embeddings
-        self.lookup_table = torch.zeros((self.max_len, 2 ** self.bits)).cuda() # per-token LUT (in current implementation)
-        self.vcache = torch.zeros((self.num_heads, self.head_dim // 8, self.max_len), dtype=torch.int).cuda()
+        self.lookup_table = torch.zeros((self.max_len, 2 ** self.bits), dtype=torch.float).cuda() # per-token LUT (in current implementation)
+        self.vcache = torch.zeros((self.num_heads, (self.head_dim // 32) * self.bits, self.max_len), dtype=torch.int).cuda()
         self.vlen = 0
 
-    def load_lookup_table(self, quantizer, include_sparse = True, sparsity_threshold = 0.99): # need to load using calibration data
+        # outlier params
+        if self.include_sparse:
+            # only supports 1% outliers
+            self.outliers = torch.zeros((self.max_len,42), dtype=torch.float).cuda()
+            self.outlier_indices = torch.zeros((self.max_len,42), dtype=torch.int).cuda()
+
+        # first few in fp16
+        self.first_few_fp16 = first_few_fp16
+
+        # Q-Norm
+        self.norm = False
+        self.lookup_table2 = None
+
+    def reset(self):
+        """
+        This class resets the compressed key cache
+        """
+        self.vlen = 0
+
+        self.lookup_table[self.lookup_table!=0] = 0
+        self.vcache[self.vcache!=0] = 0
+
+        if self.include_sparse:
+            self.outliers[self.outliers!=0] = 0
+            self.outlier_indices[self.outlier_indices!=0] = 0
+
+        if self.lookup_table2 is not None:
+            self.lookup_table2[self.lookup_table2!=0] = 0
+
+
+    def load_lookup_table(self, quantizer, include_sparse = True, sparsity_threshold = 0.99, norm=False): # need to load using calibration data
         """
         quantizer: calibrated outlier thresholds / LUT for the current layer
         include_sparse: whether to isolate outliers
         sparsity_threshold: what percentage of outliers to remove
+        norm: whether to use Q-Norm
 
         Loads the LUT for the value cache
         """
-        self.lut = torch.tensor(quantizer[2][0]).squeeze(-1).to(self.lookup_table.device)
+        self.lut = torch.tensor(quantizer[2][0]).squeeze(-1).to(self.lookup_table.device).float()
         self.lut,_ = self.lut.sort()
         self.include_sparse = include_sparse
         self.sparsity_threshold = sparsity_threshold
+        self.norm = norm
+        if self.norm:
+            self.normscale = quantizer[3].cuda()
+            self.normoffset = quantizer[4].cuda()
+            self.lookup_table2 = torch.zeros((self.max_len, 2 ** self.bits), dtype=torch.float).cuda() # per-token LUT (in current implementation)
+        else:
+            self.normscale = None
+            self.normoffset = None
+            self.lookup_table2 = None
 
-    def forward_fused_sparse(self, score, v, minval=None, maxval=None):
+
+    def forward_fused_sparse(self, score, v, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices):
         """
         score: current score vector
         v: value vector to append
+        upper_outlier_vals: upper outlier values for new v token
+        upper_outlier_indices: upper outlier indices for new v token
+        lower_outlier_vals: lower outlier values for new v token
+        lower_outlier_indices: lower outlier indices for new v token
 
         Performs the forward pass using the compressed value cache (and also appends a new value vector)
         """
+
+        v_shape = v.shape
 
         score = score.float()
         v = v.flatten()
 
         if self.include_sparse:
-            assert (minval != None)
-            assert (maxval != None)
+            assert (upper_outlier_vals != None)
+            assert (upper_outlier_indices != None)
+            assert (lower_outlier_vals != None)
+            assert (lower_outlier_indices != None)
+            maxval = upper_outlier_vals[-1]
+            minval = lower_outlier_vals[-1]
             offset = (maxval + minval) / 2
             sf = (maxval - minval) / 2
             outlier_threshold_lower = minval
@@ -566,65 +1109,275 @@ class QuantV(nn.Module):
         # get per-token LUT
         v = v.float()
         lookup_table = torch.tensor(self.lut).float() * sf.float().item() + offset.float().item()
-        self.lookup_table[self.vlen] = lookup_table
+        self.lookup_table[self.vlen - self.first_few_fp16] = lookup_table
+        #Q-Norm
+        if self.norm:
+            lookup_table2 = (torch.tensor(self.lut).float() * self.normscale + self.normoffset) * sf.float().item() + offset.float().item()
+            self.lookup_table2[self.vlen - self.first_few_fp16] = lookup_table2
+
         score = score.transpose(0,1).contiguous()
 
         # packing kernel
         if self.include_sparse:
-            zeropoint = lookup_table[7] # TODO could get minimum of 7 and 8?
-            self.rows, self.cols, self.vals, self.start_cols, self.num_threads, outlier_count = quant_cuda.vecquant4appendvecVsparse(
-                self.vcache,
-                self.lookup_table,
-                v,
-                zeropoint,
-                self.rows,
-                self.cols,
-                self.vals,
-                self.start_cols,
-                outlier_threshold_lower,
-                outlier_threshold_upper,
-                self.vlen
-            )
-            self.num_threads = self.num_threads[0]
-            self.num_nonzeros = self.vals.shape[0]
+
+            if self.bits == 4:
+                zeropoint = lookup_table[7]
+                quant_cuda.vecquant4appendvecVsparse(
+                    self.vcache,
+                    self.lookup_table,
+                    v,
+                    zeropoint,
+                    outlier_threshold_lower,
+                    outlier_threshold_upper,
+                    self.vlen - self.first_few_fp16
+                )
+
+            elif self.bits == 3:
+                zeropoint = lookup_table[3]
+                quant_cuda.vecquant3appendvecVsparse(
+                    self.vcache,
+                    self.lookup_table,
+                    v,
+                    zeropoint,
+                    outlier_threshold_lower,
+                    outlier_threshold_upper,
+                    self.vlen - self.first_few_fp16
+                )
+
+            elif self.bits == 2:
+                # for Q-Norm, get zeropoint for post-dequant
+                if self.norm:
+                    zeropoint = lookup_table2[1]
+                else:
+                    zeropoint = lookup_table[1]
+                quant_cuda.vecquant2appendvecVsparse(
+                    self.vcache,
+                    self.lookup_table,
+                    v,
+                    zeropoint,
+                    outlier_threshold_lower,
+                    outlier_threshold_upper,
+                    self.vlen - self.first_few_fp16
+                )
+
+            else:
+                assert (False)
+
+            # append sparse values
+            outlier_values_cat = torch.cat((upper_outlier_vals, lower_outlier_vals), dim=-1) - zeropoint
+            outlier_indices_cat = torch.cat((upper_outlier_indices, lower_outlier_indices), dim=-1)
+            outlier_indices,idx = outlier_indices_cat.sort()
+            outlier_vals = outlier_values_cat[idx]
+
+            # append to value cache
+            self.outliers[self.vlen - self.first_few_fp16] = outlier_vals
+            self.outlier_indices[self.vlen - self.first_few_fp16] = outlier_indices
+
         else:
-            quant_cuda.vecquant4appendvecV(
-                self.vcache,
-                self.lookup_table,
-                v,
-                self.vlen
-            )
+            if self.bits == 4:
+                quant_cuda.vecquant4appendvecV(
+                    self.vcache,
+                    self.lookup_table,
+                    v,
+                    self.vlen - self.first_few_fp16
+                )
+
+            elif self.bits == 3:
+                quant_cuda.vecquant3appendvecV(
+                    self.vcache,
+                    self.lookup_table,
+                    v,
+                    self.vlen - self.first_few_fp16
+                )
+
+            elif self.bits == 2:
+                quant_cuda.vecquant2appendvecV(
+                    self.vcache,
+                    self.lookup_table,
+                    v,
+                    self.vlen - self.first_few_fp16
+                )
+
+            else:
+                assert (False)
 
         self.vlen += 1
 
         #D+S matvec operation
         mul = torch.zeros((score.shape[0], score.shape[1], self.head_dim), dtype=torch.float, device=score.device)
         if self.include_sparse:
-            quant_cuda.vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2(
-                score,
-                self.vcache,
-                mul,
-                self.lookup_table,
-                self.vlen,
-                self.rows,
-                self.cols,
-                self.start_cols,
-                self.vals,
-                self.vlen,
-                self.num_threads,
-                self.num_nonzeros
-            )
+
+            if self.bits == 4:
+                quant_cuda.vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2(
+                    score,
+                    self.vcache,
+                    mul,
+                    self.lookup_table,
+                    self.vlen - self.first_few_fp16,
+                    self.outliers,
+                    self.outlier_indices
+                )
+
+            elif self.bits == 3:
+                quant_cuda.vecquant3matmul_nuq_perchannel_transposed_mha_batched_fused_opt2(
+                    score,
+                    self.vcache,
+                    mul,
+                    self.lookup_table,
+                    self.vlen - self.first_few_fp16,
+                    self.outliers,
+                    self.outlier_indices
+                )
+
+            elif self.bits == 2:
+                if self.norm:
+                    lookup_table = self.lookup_table2
+                else:
+                    lookup_table = self.lookup_table
+
+                quant_cuda.vecquant2matmul_nuq_perchannel_transposed_mha_batched_fused_opt2(
+                    score,
+                    self.vcache,
+                    mul,
+                    lookup_table, # self.lookup_table
+                    self.vlen - self.first_few_fp16,
+                    self.outliers,
+                    self.outlier_indices
+                )
+
+            else:
+                assert (False)
+
         else:
-            quant_cuda.vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt(
-                score,
-                self.vcache,
-                mul,
-                self.lookup_table,
-                self.vlen
-            )
+
+            if self.bits == 4:
+                quant_cuda.vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt(
+                    score,
+                    self.vcache,
+                    mul,
+                    self.lookup_table,
+                    self.vlen - self.first_few_fp16
+                )
+
+            elif self.bits == 3:
+                quant_cuda.vecquant3matmul_nuq_perchannel_transposed_mha_batched_fused_opt(
+                    score,
+                    self.vcache,
+                    mul,
+                    self.lookup_table,
+                    self.vlen - self.first_few_fp16
+                )
+
+            elif self.bits == 2:
+                if self.norm:
+                    lookup_table = self.lookup_table2
+                else:
+                    lookup_table = self.lookup_table
+
+                quant_cuda.vecquant2matmul_nuq_perchannel_transposed_mha_batched_fused_opt(
+                    score,
+                    self.vcache,
+                    mul,
+                    lookup_table, # self.lookup_table
+                    self.vlen - self.first_few_fp16
+                )
+
+            else:
+                assert (False)
+
         mul = mul.transpose(0,1).contiguous()
         mul = mul.half()
         return mul
+
+    def parallel_pack(self, v, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices):
+        """
+        v: value vectors to append
+        upper_outlier_vals: upper outlier values for new v tokens
+        upper_outlier_indices: upper outlier indices for new v tokens
+        lower_outlier_vals: lower outlier values for new v tokens
+        lower_outlier_indices: lower outlier indices for new v tokens
+
+        Pack several value vectors in parallel
+        """
+
+        v = v.float()
+        self.vlen += v.shape[-1]
+
+        if self.include_sparse:
+            assert (upper_outlier_vals != None)
+            assert (upper_outlier_indices != None)
+            assert (lower_outlier_vals != None)
+            assert (lower_outlier_indices != None)
+            maxval = upper_outlier_vals[:,-1]
+            minval = lower_outlier_vals[:,-1]
+            offset = (maxval + minval) / 2
+            sf = (maxval - minval) / 2
+            outlier_threshold_lower = minval
+            outlier_threshold_upper = maxval
+        else:
+            assert (False)
+
+        # get per-token LUT
+        lookup_table = torch.tensor(self.lut).float().unsqueeze(0) * sf.float().unsqueeze(-1) + offset.float().unsqueeze(-1)
+        self.lookup_table[:self.vlen] = lookup_table
+
+        # packing kernel
+        if self.include_sparse:
+            self.vcache = self.vcache.contiguous()
+            v = v.contiguous()
+
+            if self.bits == 4:
+                quant_cuda.vecquant4appendvecVsparseParallel(
+                    self.vcache,
+                    self.lookup_table,
+                    v,
+                    outlier_threshold_lower,
+                    outlier_threshold_upper
+                )
+                zpt = 7
+
+            elif self.bits == 3:
+                quant_cuda.vecquant3appendvecVsparseParallel(
+                    self.vcache,
+                    self.lookup_table,
+                    v,
+                    outlier_threshold_lower,
+                    outlier_threshold_upper
+                )
+                zpt = 3
+
+            elif self.bits == 2:
+                quant_cuda.vecquant2appendvecVsparseParallel(
+                    self.vcache,
+                    self.lookup_table,
+                    v,
+                    outlier_threshold_lower,
+                    outlier_threshold_upper
+                )
+                zpt = 1
+
+            else:
+                assert (False)
+
+            # for Q-Norm, get zeropoint for post-dequant
+            if self.norm:
+                lookup_table = self.lookup_table2
+            else:
+                lookup_table = self.lookup_table
+
+            # append sparse values - outliers are (5,21)
+            outlier_values_cat = torch.cat((upper_outlier_vals, lower_outlier_vals), dim=-1) - lookup_table[:self.vlen,zpt].unsqueeze(-1)
+            outlier_indices_cat = torch.cat((upper_outlier_indices, lower_outlier_indices), dim=-1)
+            outlier_indices,idx = outlier_indices_cat.sort()
+            outlier_vals = outlier_values_cat[torch.arange(outlier_values_cat.size(0)).unsqueeze(1), idx]
+
+            # need to append to outlier cache
+            self.outliers[:self.vlen] = outlier_vals
+            self.outlier_indices[:self.vlen] = outlier_indices
+
+        else:
+            assert (False)
+
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -662,14 +1415,58 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
         self.device = None
+
+        # avoid caching cos / sin for RoPE
+        self.dynamicrope = config.dynamicrope
         self._init_rope()
 
+        # argument to use original sparsity configuration
+        self.use_orig_sparse = config.use_orig_sparse
+
+        # argument to use attention sink method
+        self.first_few_fp16 = config.first_few_fp16
+
+        # set max seqlen for KV cache
+        if config.maxseqlen > -1:
+            maxseqlen = config.maxseqlen
+        else:
+            maxseqlen = self.max_position_embeddings
+
+        # load other arguments
+        self.abits = config.abits
+        self.include_sparse = config.include_sparse
+
         # arguments to initialize the KV cache are in the load_lookup_table functions
-        self.kcache = QuantK(hidden_size=self.hidden_size, max_position_embeddings=self.max_position_embeddings)
-        self.vcache = QuantV(hidden_size=self.hidden_size, max_position_embeddings=self.max_position_embeddings)
+        self.kcache = QuantK(
+            bits=self.abits,
+            include_sparse=self.include_sparse,
+            hidden_size=self.hidden_size,
+            max_position_embeddings=maxseqlen,
+            rope_theta=self.rope_theta,
+            use_orig_sparse=self.use_orig_sparse,
+            first_few_fp16=self.first_few_fp16
+        )
+        self.vcache = QuantV(
+            bits=self.abits,
+            include_sparse=self.include_sparse,
+            hidden_size=self.hidden_size,
+            max_position_embeddings=maxseqlen,
+            first_few_fp16=self.first_few_fp16
+        )
+
+        # fp16 caches
+        if self.first_few_fp16 > 0:
+            self.kcache_fp16 = torch.zeros((1, self.num_heads, self.head_dim, self.first_few_fp16), dtype=torch.half).cuda()
+            self.vcache_fp16 = torch.zeros((1, self.num_heads, self.first_few_fp16, self.head_dim), dtype=torch.half).cuda()
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        if self.config.rope_scaling is None and self.dynamicrope:
+            self.rotary_emb = LlamaRotaryEmbeddingDynamic(
+                self.head_dim,
+                base=self.rope_theta,
+                device="cpu"
+            )
+        elif self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
@@ -719,20 +1516,45 @@ class LlamaAttention(nn.Module):
 
         bsz, q_len, _ = hidden_states.size()
 
+        assert(bsz == 1) # only supports BS=1 for now
+
         # topk offloading to CPU
-        if self.kcache.include_sparse:
+        if self.kcache.include_sparse and not (q_len > 1 and self.kcache.klen == 0):
             s2 = torch.cuda.Stream(device="cuda:0")
             value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             v = value_states.flatten().float()
             s2.wait_stream(torch.cuda.default_stream(torch.device('cuda:0'))) # needed for correct execution
+
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
             with torch.cuda.stream(s2):
                 v = v.cpu() # asynchronous mem copy, CPU can now run ahead
                 threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 1
-                maxval = torch.topk(v,threshold_k).values[-1]
-                minval = torch.topk(v,threshold_k,largest=False).values[-1]
+                upper_outlier_vals,upper_outlier_indices = torch.topk(v,threshold_k)
+                lower_outlier_vals,lower_outlier_indices = torch.topk(v,threshold_k,largest=False)
+                upper_outlier_vals = upper_outlier_vals.cuda()
+                lower_outlier_vals = lower_outlier_vals.cuda()
+                upper_outlier_indices = upper_outlier_indices.cuda()
+                lower_outlier_indices = lower_outlier_indices.cuda()
+
+        elif self.kcache.include_sparse:
+            value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+            v = value_states.float().reshape(q_len, self.num_key_value_heads*self.head_dim)
+            value_states = value_states.transpose(1, 2)
+            query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+            # block topK on GPU
+            threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 1
+            upper_outlier_vals,upper_outlier_indices = torch.topk(v,threshold_k,dim=-1)
+            lower_outlier_vals,lower_outlier_indices = torch.topk(v,threshold_k,dim=-1,largest=False)
+
         else:
+            upper_outlier_vals = None
+            lower_outlier_vals = None
+            upper_outlier_indices = None
+            lower_outlier_indices = None
             value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -740,15 +1562,104 @@ class LlamaAttention(nn.Module):
         key_states = key_states.half()
         value_states = value_states.half()
 
-        kv_seq_len = self.kcache.klen + 1
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states = apply_rotary_pos_emb_query(query_states, cos, sin, position_ids)
+        if self.kcache.klen == 0:
+            kv_seq_len = key_states.shape[-2]
+        else:
+            kv_seq_len = self.kcache.klen + 1
 
-        # fused forward pass
-        query_states = query_states[0,:,:,:]
-        attn_weights = self.kcache.forward_fused_sparse(query_states, key_states)
-        attn_weights = attn_weights / math.sqrt(self.head_dim)
-        attn_weights = attn_weights.unsqueeze(0)
+        # dynamically compute cos / sin for RoPE
+        if self.dynamicrope:
+            start_pos = self.kcache.klen
+            end_pos = self.kcache.klen + q_len
+            cos, sin = self.rotary_emb(value_states, start_pos, end_pos)
+            query_states = apply_rotary_pos_emb_query_dynamic(query_states, cos, sin, position_ids)
+        else:
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states = apply_rotary_pos_emb_query(query_states, cos, sin, position_ids)
+
+        if q_len > 1 and self.kcache.klen == 0:
+
+            # whether to use dynamic or cached sin/cos
+            if self.dynamicrope:
+                key_states_rope = apply_rotary_pos_emb_query_dynamic(key_states, cos, sin, position_ids)
+            else:
+                key_states_rope = apply_rotary_pos_emb_query(key_states, cos, sin, position_ids)
+
+            # parallel version (not using quantized KV cache)
+            key_states_rope = key_states_rope.transpose(2, 3)
+            attn_weights = torch.matmul(query_states, key_states_rope) / math.sqrt(self.head_dim)
+
+            # support for keeping first few tokens in fp16
+            if self.first_few_fp16 > 0:
+                if q_len > self.first_few_fp16:
+                    # parallel append
+                    key_states = key_states[0,:,self.first_few_fp16:,:].transpose(1, 2)
+                    if self.use_orig_sparse:
+                        self.kcache.parallel_pack_orig(key_states)
+                    else:
+                        self.kcache.parallel_pack(key_states)
+
+                    # create fp16 k cache
+                    self.kcache_fp16[:,:,:,:] = key_states_rope[:,:,:,:self.first_few_fp16]
+                    self.kcache.klen += self.first_few_fp16
+
+                else:
+                    # only initialize fp16 kcache
+                    self.kcache_fp16[:,:,:,:q_len] = key_states_rope
+                    self.kcache.klen += q_len
+
+            else: # no fp16 kcache
+
+                # parallel append
+                key_states = key_states[0,:,:,:].transpose(1, 2)
+                if self.use_orig_sparse:
+                    self.kcache.parallel_pack_orig(key_states)
+                else:
+                    self.kcache.parallel_pack(key_states)
+        else:
+
+            if self.kcache.klen < self.first_few_fp16:
+                # whether to use dynamic or cached sin/cos
+                if self.dynamicrope:
+                    key_states_rope = apply_rotary_pos_emb_query_dynamic(key_states, cos, sin, position_ids)
+                else:
+                    key_states_rope = apply_rotary_pos_emb_query(key_states, cos, sin, position_ids)
+                key_states_rope = key_states_rope.transpose(2, 3)
+
+                # append to fp16 k cache
+                self.kcache_fp16[:,:,:,self.kcache.klen] = key_states_rope.squeeze(-1)
+                self.kcache.klen += 1
+
+                # perform multiplication
+                ktensor = self.kcache_fp16[:,:,:,:self.kcache.klen]
+                attn_weights = torch.matmul(query_states, ktensor) / math.sqrt(self.head_dim)
+
+            elif self.first_few_fp16 > 0:
+                # compute fp16 kcache
+                attn_weights_fp16 = torch.matmul(query_states, self.kcache_fp16) / math.sqrt(self.head_dim)
+
+                # fused forward pass
+                query_states = query_states[0,:,:,:]
+                if self.use_orig_sparse:
+                    attn_weights = self.kcache.forward_fused_sparse_orig(query_states, key_states)
+                else:
+                    attn_weights = self.kcache.forward_fused_sparse(query_states, key_states)
+                attn_weights = attn_weights.unsqueeze(0)
+                attn_weights = attn_weights / math.sqrt(self.head_dim)
+
+                # append fp16 weights to start
+                attn_weights = torch.cat((attn_weights_fp16, attn_weights), dim=-1)
+
+            else:
+                query_states = query_states[0,:,:,:]
+
+                # fused forward pass
+                if self.use_orig_sparse:
+                    attn_weights = self.kcache.forward_fused_sparse_orig(query_states, key_states)
+                else:
+                    attn_weights = self.kcache.forward_fused_sparse(query_states, key_states)
+                attn_weights = attn_weights.unsqueeze(0)
+                attn_weights = attn_weights / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -768,9 +1679,57 @@ class LlamaAttention(nn.Module):
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
         # fused forward pass
-        attn_weights = attn_weights.squeeze(0)
-        attn_output = self.vcache.forward_fused_sparse(attn_weights, value_states, minval=minval, maxval=maxval)
-        attn_output = attn_output.unsqueeze(0)
+        if q_len > 1  and self.vcache.vlen == 0:
+            # parallel version
+            attn_output = torch.matmul(attn_weights, value_states)
+
+            # parallel append
+            if self.first_few_fp16 > 0:
+
+                if q_len > self.first_few_fp16:
+
+                    # create fp16 vcache
+                    self.vcache_fp16[:,:,:,:] = value_states[:,:,:self.first_few_fp16,:]
+
+                    # parallel append
+                    value_states = value_states[0,:,self.first_few_fp16:,:].transpose(1, 2)
+                    self.vcache.parallel_pack(value_states, upper_outlier_vals[self.first_few_fp16:,:], upper_outlier_indices[self.first_few_fp16:,:], lower_outlier_vals[self.first_few_fp16:,:], lower_outlier_indices[self.first_few_fp16:,:])
+
+                    # create fp16 k cache
+                    self.vcache.vlen += self.first_few_fp16
+
+                else:
+                    # only initialize fp16 kcache
+                    self.vcache_fp16[:,:,:q_len,:] = value_states
+                    self.vcache.vlen += q_len
+
+            else:
+                value_states = value_states[0,:,:,:].transpose(1, 2)
+                self.vcache.parallel_pack(value_states, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices)
+
+        else:
+            if self.vcache.vlen < self.first_few_fp16:
+                self.vcache_fp16[:,:,self.vcache.vlen,:] = value_states.squeeze(2)
+                self.vcache.vlen += 1
+                attn_output = torch.matmul(attn_weights, self.vcache_fp16[:,:,:self.vcache.vlen,:])
+
+            elif self.first_few_fp16 > 0:
+                # compute fp16 vcache attention
+                attn_output_fp16 = torch.matmul(attn_weights[:,:,:,:self.first_few_fp16], self.vcache_fp16)
+
+                # compute quantized vcache attention
+                attn_weights = attn_weights.squeeze(0)
+                attn_output = self.vcache.forward_fused_sparse(attn_weights[:,:,self.first_few_fp16:], value_states, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices)
+                attn_output = attn_output.unsqueeze(0)
+
+                # sum attention outputs
+                attn_output += attn_output_fp16
+
+            else:
+                attn_weights = attn_weights.squeeze(0)
+                attn_output = self.vcache.forward_fused_sparse(attn_weights, value_states, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices)
+                attn_output = attn_output.unsqueeze(0)
+
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -779,8 +1738,8 @@ class LlamaAttention(nn.Module):
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
 
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
@@ -792,8 +1751,7 @@ class LlamaAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, None #past_key_value
-
+        return attn_output, attn_weights, None
 
 class LlamaFlashAttention2(LlamaAttention):
     """
@@ -809,6 +1767,7 @@ class LlamaFlashAttention2(LlamaAttention):
         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+        self.test = False
 
     def forward(
         self,
@@ -833,66 +1792,211 @@ class LlamaFlashAttention2(LlamaAttention):
 
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        assert(bsz == 1) # only supports BS=1 for now
 
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
-        # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        if self.kcache.include_sparse and not (q_len > 1 and self.kcache.klen == 0):
+            s2 = torch.cuda.Stream(device="cuda:0")
+            value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            v = value_states.flatten().float()
+            s2.wait_stream(torch.cuda.default_stream(torch.device('cuda:0'))) # needed for correct execution
 
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+            query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            with torch.cuda.stream(s2):
+                v = v.cpu() # asynchronous mem copy, CPU can now run ahead
+                threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 1
+                upper_outlier_vals,upper_outlier_indices = torch.topk(v,threshold_k)
+                lower_outlier_vals,lower_outlier_indices = torch.topk(v,threshold_k,largest=False)
+                upper_outlier_vals = upper_outlier_vals.cuda()
+                lower_outlier_vals = lower_outlier_vals.cuda()
+                upper_outlier_indices = upper_outlier_indices.cuda()
+                lower_outlier_indices = lower_outlier_indices.cuda()
 
-        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-        # to be able to avoid many of these transpose/reshape/view.
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        elif self.kcache.include_sparse:
+            value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+            v = value_states.float().reshape(q_len, self.num_key_value_heads*self.head_dim)
+            value_states = value_states.transpose(1, 2)
+            query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        dropout_rate = self.attention_dropout if self.training else 0.0
+            # block topK on GPU
+            threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 1
+            upper_outlier_vals,upper_outlier_indices = torch.topk(v,threshold_k,dim=-1)
+            lower_outlier_vals,lower_outlier_indices = torch.topk(v,threshold_k,dim=-1,largest=False)
 
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in the correct dtype just to be sure everything works as expected.
-        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        # in fp32. (LlamaRMSNorm handles it correctly)
+        else:
+            upper_outlier_vals = None
+            lower_outlier_vals = None
+            upper_outlier_indices = None
+            lower_outlier_indices = None
+            value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        input_dtype = query_states.dtype
-        if input_dtype == torch.float32:
-            if torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
-            # Handle the case where the model is quantized
-            elif hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
+        key_states = key_states.half()
+        value_states = value_states.half()
+
+        if self.kcache.klen == 0:
+            kv_seq_len = key_states.shape[-2]
+        else:
+            kv_seq_len = self.kcache.klen + 1
+
+        # dynamically compute cos / sin for RoPE
+        if self.dynamicrope:
+            start_pos = self.kcache.klen
+            end_pos = self.kcache.klen + q_len
+            cos, sin = self.rotary_emb(value_states, start_pos, end_pos)
+            query_states = apply_rotary_pos_emb_query_dynamic(query_states, cos, sin, position_ids)
+        else:
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states = apply_rotary_pos_emb_query(query_states, cos, sin, position_ids)
+
+        if q_len > 1 and self.kcache.klen == 0:
+            # flash attention
+            if self.dynamicrope:
+                key_states_rope = apply_rotary_pos_emb_query_dynamic(key_states, cos, sin, position_ids)
             else:
-                target_dtype = self.q_proj.weight.dtype
+                key_states_rope = apply_rotary_pos_emb_query(key_states, cos, sin, position_ids)
 
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
+            query_states_flash = query_states.transpose(1, 2)
+            key_states_flash = key_states_rope.transpose(1, 2)
+            value_states_flash = value_states.transpose(1, 2)
+            attn_output = self._flash_attention_forward(
+                query_states_flash, key_states_flash, value_states_flash, attention_mask, q_len, dropout=0.0
             )
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
 
-            query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
+            # parallel append - K
+            if self.first_few_fp16 > 0:
+                key_states_rope = key_states_rope.transpose(2, 3)
+                if q_len > self.first_few_fp16:
+                    # parallel append
+                    key_states = key_states[0,:,self.first_few_fp16:,:].transpose(1, 2)
+                    if self.use_orig_sparse:
+                        self.kcache.parallel_pack_orig(key_states)
+                    else:
+                        self.kcache.parallel_pack(key_states)
 
-        attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
-        )
+                    # create fp16 k cache
+                    self.kcache_fp16[:,:,:,:] = key_states_rope[:,:,:,:self.first_few_fp16]
+                    self.kcache.klen += self.first_few_fp16
 
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+                else:
+                    # only initialize fp16 kcache
+                    self.kcache_fp16[:,:,:,:q_len] = key_states_rope
+                    self.kcache.klen += q_len
+
+            else: # no fp16 kcache
+
+                # parallel append
+                key_states = key_states[0,:,:,:].transpose(1, 2)
+                if self.use_orig_sparse:
+                    self.kcache.parallel_pack_orig(key_states)
+                else:
+                    self.kcache.parallel_pack(key_states)
+
+            # parallel append - V
+            if self.first_few_fp16 > 0:
+
+                if q_len > self.first_few_fp16:
+
+                    # create fp16 vcache
+                    self.vcache_fp16[:,:,:,:] = value_states[:,:,:self.first_few_fp16,:]
+
+                    # parallel append
+                    value_states = value_states[0,:,self.first_few_fp16:,:].transpose(1, 2)
+                    self.vcache.parallel_pack(value_states, upper_outlier_vals[self.first_few_fp16:,:], upper_outlier_indices[self.first_few_fp16:,:], lower_outlier_vals[self.first_few_fp16:,:], lower_outlier_indices[self.first_few_fp16:,:])
+
+                    # create fp16 k cache
+                    self.vcache.vlen += self.first_few_fp16
+
+                else:
+                    # only initialize fp16 kcache
+                    self.vcache_fp16[:,:,:q_len,:] = value_states
+                    self.vcache.vlen += q_len
+
+            else:
+                value_states = value_states[0,:,:,:].transpose(1, 2)
+                self.vcache.parallel_pack(value_states, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices)
+
+        else:
+
+            # fused forward pass for query
+            if self.kcache.klen < self.first_few_fp16:
+                # whether to use dynamic or cached sin/cos
+                if self.dynamicrope:
+                    key_states_rope = apply_rotary_pos_emb_query_dynamic(key_states, cos, sin, position_ids)
+                else:
+                    key_states_rope = apply_rotary_pos_emb_query(key_states, cos, sin, position_ids)
+                key_states_rope = key_states_rope.transpose(2, 3)
+
+                # append to fp16 k cache
+                self.kcache_fp16[:,:,:,self.kcache.klen] = key_states_rope.squeeze(-1)
+                self.kcache.klen += 1
+
+                # perform multiplication
+                ktensor = self.kcache_fp16[:,:,:,:self.kcache.klen]
+                attn_weights = torch.matmul(query_states, ktensor) / math.sqrt(self.head_dim)
+
+            elif self.first_few_fp16 > 0:
+                # compute fp16 kcache
+                attn_weights_fp16 = torch.matmul(query_states, self.kcache_fp16) / math.sqrt(self.head_dim)
+
+                # fused forward pass
+                query_states = query_states[0,:,:,:]
+                if self.use_orig_sparse:
+                    attn_weights = self.kcache.forward_fused_sparse_orig(query_states, key_states)
+                else:
+                    attn_weights = self.kcache.forward_fused_sparse(query_states, key_states)
+                attn_weights = attn_weights.unsqueeze(0)
+                attn_weights = attn_weights / math.sqrt(self.head_dim)
+
+                # append fp16 weights to start
+                attn_weights = torch.cat((attn_weights_fp16, attn_weights), dim=-1)
+
+            else:
+                query_states = query_states[0,:,:,:]
+
+                # fused forward pass
+                if self.use_orig_sparse:
+                    attn_weights = self.kcache.forward_fused_sparse_orig(query_states, key_states)
+                else:
+                    attn_weights = self.kcache.forward_fused_sparse(query_states, key_states)
+                attn_weights = attn_weights.unsqueeze(0)
+                attn_weights = attn_weights / math.sqrt(self.head_dim)
+
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+
+            # fused forward pass - V
+            if self.vcache.vlen < self.first_few_fp16:
+                self.vcache_fp16[:,:,self.vcache.vlen,:] = value_states.squeeze(2)
+                self.vcache.vlen += 1
+                attn_output = torch.matmul(attn_weights, self.vcache_fp16[:,:,:self.vcache.vlen,:])
+
+            elif self.first_few_fp16 > 0:
+                # compute fp16 vcache attention
+                attn_output_fp16 = torch.matmul(attn_weights[:,:,:,:self.first_few_fp16], self.vcache_fp16)
+
+                # compute quantized vcache attention
+                attn_weights = attn_weights.squeeze(0)
+                attn_output = self.vcache.forward_fused_sparse(attn_weights[:,:,self.first_few_fp16:], value_states, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices)
+                attn_output = attn_output.unsqueeze(0)
+
+                # sum attention outputs
+                attn_output += attn_output_fp16
+
+            else:
+                attn_weights = attn_weights.squeeze(0)
+                attn_output = self.vcache.forward_fused_sparse(attn_weights, value_states, upper_outlier_vals, upper_outlier_indices, lower_outlier_vals, lower_outlier_indices)
+                attn_output = attn_output.unsqueeze(0)
+
+            # reshape attn output
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -996,7 +2100,6 @@ class LlamaFlashAttention2(LlamaAttention):
             (cu_seqlens_q, cu_seqlens_k),
             (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
         )
-
 
 class LlamaSdpaAttention(LlamaAttention):
     """
@@ -1322,6 +2425,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.split_gpus = num_visible_devices > 1
         print(f"splitting into {num_visible_devices} GPUs")
         if not self.split_gpus:
+            # print('max memory(MiB):', torch.cuda.memory_allocated() / 1024 /1024)
             self.cuda()
         else:
             # For larger model, we need to split the model into multiple GPUs
@@ -1427,7 +2531,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # embed positions
         hidden_states = inputs_embeds
-        hidden_states.requires_grad_(True)
+        # hidden_states.requires_grad_(True)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1456,7 +2560,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache,
                 )
             else:
-                hidden_states.requires_grad_(True)
+                # hidden_states.requires_grad_(True)
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -1595,7 +2699,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        # logits = logits.float()
 
         loss = None
         if labels is not None:
@@ -1623,7 +2727,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, kvquant=False, **kwargs
     ):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
@@ -1661,6 +2765,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
                 position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        if kvquant:
+            position_ids = position_ids[:,-1:]
+            # attention_mask = attention_mask[:,-1:]
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:

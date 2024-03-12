@@ -158,7 +158,7 @@ activities=[
         for i in range(0,num_iters):
             newk = k_act[i]
 
-            rows2, cols2, vals2, start_rows, num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparse(
+            rows2, cols2, vals2, start_rows, num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparseorig(
                 kcache2,
                 lookup_table,
                 newk,

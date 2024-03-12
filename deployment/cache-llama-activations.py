@@ -240,6 +240,7 @@ if __name__ == '__main__':
     model = get_model_longseqlen(args.model, args.seqlen, args.maxseqlen)
     model = model.half()
     model.eval()
+    model.model.set_devices()
 
     dataloader, testloader = get_loaders(
         "wikitext2", nsamples=args.nsamples, seed=0, model=args.model, seqlen=model.seqlen
@@ -265,12 +266,9 @@ if __name__ == '__main__':
         perchannelquant_perchanneloutliers_q,
         4,
         perchannel=True,
-        perchanneloutliers=True,
-        zeropoint=True,
         include_sparse=True,
         sparsity_threshold=0.99,
         dynamicquantization=False,
-        dynamicoutliers=False,
         nuq=True
     )
 
@@ -280,12 +278,9 @@ if __name__ == '__main__':
         pertokenquant_perchanneloutliers_q,
         4,
         perchannel=False,
-        perchanneloutliers=True,
-        zeropoint=True,
         include_sparse=True,
         sparsity_threshold=0.99,
         dynamicquantization=True,
-        dynamicoutliers=True,
         nuq=True
     )
 

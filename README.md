@@ -16,6 +16,24 @@ KVQuant enables serving the **LLaMA-7B model with 1M context length on a single 
 [[Paper](https://arxiv.org/abs/2401.18079)]
 
 ---
+
+## Long Context Length Inference with Large World Model
+
+[Large World Model (LWM)](https://github.com/LargeWorldModel/LWM) is a recent work that enables training long context length models with up to 1M context length. However, inferring these models is extremely resource intensive due to the large size of the KV cache that must be stored throughout inference. Using KVQuant, we can now infer these long context length models efficiently on a single A100! 
+
+The lmw/ directory contains scripts for running inference and evaluation using the quantized Large World Models.
+
+---
+
+## Additional Method Improvements
+To further improve our methodology for supporting long context length inference, we have made several improvements:
+- `Parallel topK support on GPU and kernels for parallel prompt processing` - we have augmented our open-source support with additional kernels to perform parallel packing with multiple input tokens, and also modified our inference code to utilize the GPU for parallel topK when appending many value tokens in parallel.
+- `Capping Key Outliers` - we have added support for running both calibration and inference with a fixed number of outliers per token for keys. This allows us to design more efficient kernels, since there is a maximum number of outliers per token for both keys and values, and it makes memory allocation easier for our method since we can allocate fixed-size memory for each key. 
+- `Attention Sink-Aware Quantization` - based on the insight from the [Attention Sink](https://arxiv.org/abs/2309.17453) paper that the model concentrates its attention on the first token, we have added support during both calibration and inference for leaving a small number of initial keys and values (eg. 5) in fp16. This can allow for significant performance gains, and was also introduced as a method for improving quantization performance in another concurrent work [IntactKV](https://arxiv.org/abs/2403.01241).
+More detailed evaluation and analysis for these improvements will be added to the arxiv preprint shortly!
+
+
+---
 ## Installation
 
 The codebase contains three different subfolders, each of which has its own README file with instructions that you can follow for installing the required environment for that step.
@@ -27,6 +45,7 @@ The codebase contains three different subfolders, each of which has its own READ
 - `gradients` - codebase for computing fisher information - this is required to be able to quantize a new model
 - `quant` - codebase for running simulated quantization + eval experiments (need to first compute fisher information)
 - `deployment` - codebase for running efficient inference with compressed vectors (need to first get quantizers from quant step)
+- `lwm` - code for running inference with and evaluating quantized LWM models
 
 To reproduce the perplexity numbers reported in the paper, run `gradients` and then `quant`.
 

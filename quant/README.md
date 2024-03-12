@@ -26,17 +26,17 @@ pip install flash-attn --no-build-isolation
 
 1. Quantize the model using nuq4-1% (note that <path-to-fisher-info> is the path to the directory after computing gradients, and that this step is mostly run on the CPU since we need to run K-means):
 ```
-CUDA_VISIBLE_DEVICES=0 python llama_simquant.py <path-to-llama-7b-hf> --abits 4 --nsamples 16 --seqlen 2048 --nuq --fisher <path-to-fisher-info> --quantize --include_sparse --sparsity-threshold 0.99 --quantizer_path quantizers.pickle ;
+CUDA_VISIBLE_DEVICES=0 python llama_simquant.py <path-to-llama-7b-hf> --abits 4 --nsamples 16 --seqlen 2048 --nuq --fisher <path-to-fisher-info> --quantize --include_sparse --sparsity-threshold 0.99 --quantizer-path quantizers.pickle ;
 ```
 
 2. Evaluate with quantizer using nuq4-1%:
 ```
-CUDA_VISIBLE_DEVICES=0 python llama_simquant.py <path-to-llama-7b-hf> --abits 4 --nsamples 16 --seqlen 2048 --nuq --include_sparse --sparsity-threshold 0.99 --quantizer_path quantizers.pickle ;
+CUDA_VISIBLE_DEVICES=0 python llama_simquant.py <path-to-llama-7b-hf> --abits 4 --nsamples 16 --seqlen 2048 --nuq --include_sparse --sparsity-threshold 0.99 --quantizer-path quantizers.pickle ;
 ```
 
 3. Passkey evaluation with quantizer using nuq4-1% (note that the multi-GPU inference environment for running long sequence length passkey evaluation with larger models / longer context lengths is on the roadmap):
 ```
-CUDA_VISIBLE_DEVICES=0 python eval_passkey_simquant.py --path_to_ckp <path-to-llama-7b-hf> --abits 4 --simquant --quantizer_path quantizers.pickle ;
+CUDA_VISIBLE_DEVICES=0 python eval_passkey_simquant.py --path_to_ckp <path-to-llama-7b-hf> --abits 4 --simquant --quantizer-path quantizers.pickle ;
 ```
 
 ---

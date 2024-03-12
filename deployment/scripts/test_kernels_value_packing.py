@@ -149,7 +149,7 @@ activities=[
             outlier_threshold_lower = lookup_table[0]
             outlier_threshold_upper = lookup_table[-1]
 
-            rows2, cols2, vals2, start_cols, num_threads, outlier_count = quant_cuda.vecquant4appendvecVsparse(vcache2, lookup_table2, newv, zeropoint, rows2, cols2, vals2, start_cols, outlier_threshold_lower, outlier_threshold_upper, i)
+            rows2, cols2, vals2, start_cols, num_threads, outlier_count = quant_cuda.vecquant4appendvecVsparseorig(vcache2, lookup_table2, newv, zeropoint, rows2, cols2, vals2, start_cols, outlier_threshold_lower, outlier_threshold_upper, i)
             num_threads = num_threads[0]
             num_nonzeros = vals2.shape[0]
 

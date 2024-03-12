@@ -146,7 +146,7 @@ def llama_eval(model, testenc, dev):
     return ppl.item()
 
 @torch.no_grad()
-def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match, bits, include_sparse=False, sparsity_threshold=0.999, nuq=False, fisher=None, norm=False):
+def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match, bits, include_sparse=False, sparsity_threshold=0.999, nuq=False, fisher=None, norm=False, cap_outliers=False, first_few_fp16=False):
     print('Starting ...')
 
     use_cache = model.config.use_cache
@@ -263,12 +263,23 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
             else:
                 fisher_info = None
 
+            #cap is always onlyK
+            if "k_proj" in name:
+                if cap_outliers == -1:
+                    cap = False
+                else:
+                    cap = True
+            else:
+                cap = False
+
             quantizers['model.layers.%d.%s' % (i, name)] = simquant[name].quantize(
                 include_sparse=include_sparse,
                 sparsity_threshold=sparsity_threshold,
                 nuq=nuq,
                 fisher=fisher_info,
-                norm=norm
+                norm=norm,
+                cap_outliers=cap,
+                first_few_fp16=first_few_fp16
             )
             simquant[name].free()
 
@@ -342,7 +353,7 @@ if __name__ == '__main__':
         help='Whether to use q-norm.'
     )
     parser.add_argument(
-        '--quantizer_path', type=str, default=None,
+        '--quantizer-path', type=str, default=None,
         help='Path to load/store quantizer file'
     )
 
@@ -366,6 +377,20 @@ if __name__ == '__main__':
     parser.add_argument(
         '--dataset', type=str, choices=['wikitext2', 'c4'], default='wikitext2',
         help='Which dataset to use for calibration / evaluation.'
+    )
+    
+    # arguments for capping outliers and for attention sink
+    parser.add_argument(
+        '--cap_outliers', type=float, default=-1,
+        help='Max % of outliers to retain per token.'
+    )
+    parser.add_argument(
+        '--first_few_fp16', type=int, default=-1,
+        help='Leave first few outlier tokens.'
+    )
+    parser.add_argument(
+        '--clamp', action='store_true',
+        help='Clamp w/ integer quantization'
     )
 
     DEV = torch.device('cuda:0')
@@ -436,7 +461,9 @@ if __name__ == '__main__':
             sparsity_threshold=args.sparsity_threshold,
             nuq=args.nuq,
             fisher=fisher,
-            norm=args.norm
+            norm=args.norm,
+            cap_outliers=args.cap_outliers,
+            first_few_fp16=args.first_few_fp16
         )
 
         with open(args.quantizer_path, 'wb') as handle:
@@ -479,7 +506,10 @@ if __name__ == '__main__':
             dynamicquantization=False,
             nuq=args.nuq,
             nf_nuq=args.nf,
-            norm=args.norm
+            norm=args.norm,
+            cap_outliers=args.cap_outliers,
+            first_few_fp16=args.first_few_fp16,
+            clamp=args.clamp
         )
 
         #per-vector quant
@@ -493,7 +523,10 @@ if __name__ == '__main__':
             dynamicquantization=True,
             nuq=args.nuq,
             nf_nuq=args.nf,
-            norm=args.norm
+            norm=args.norm,
+            cap_outliers=args.cap_outliers,
+            first_few_fp16=args.first_few_fp16,
+            clamp=args.clamp
         )
 
         #run evaluation

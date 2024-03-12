@@ -1432,6 +1432,9 @@ class GenerationMixin:
             negative_prompt_attention_mask=negative_prompt_attention_mask,
         )
 
+        # for KVQuant
+        max_length = generation_config.max_length
+
         # 9. prepare stopping criteria
         prepared_stopping_criteria = self._get_stopping_criteria(
             generation_config=generation_config, stopping_criteria=stopping_criteria
@@ -1486,6 +1489,8 @@ class GenerationMixin:
                 return_dict_in_generate=generation_config.return_dict_in_generate,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                max_length=max_length,
+                kvquant=True,
                 **model_kwargs,
             )
 
@@ -1533,6 +1538,8 @@ class GenerationMixin:
                 return_dict_in_generate=generation_config.return_dict_in_generate,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                max_length=max_length,
+                kvquant=True,
                 **model_kwargs,
             )
 
@@ -2158,6 +2165,7 @@ class GenerationMixin:
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: bool = False,
+        kvquant: bool = False,
         streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
@@ -2297,6 +2305,10 @@ class GenerationMixin:
         # keep track of which sequences are already finished
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
+        # KVQuant
+        first_iter = False
+        ret_input_ids = input_ids
+
         this_peer_finished = False  # used by synced_gpus only
         while True:
             if synced_gpus:
@@ -2310,7 +2322,8 @@ class GenerationMixin:
                     break
 
             # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            model_inputs = self.prepare_inputs_for_generation(input_ids, kvquant=(first_iter and kvquant), **model_kwargs)
+            first_iter = True
 
             # forward pass to get next token
             outputs = self(
@@ -2356,7 +2369,15 @@ class GenerationMixin:
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
             # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            # input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+
+            # update generated ids, model inputs, and length for next step
+            if kvquant:
+                input_ids = next_tokens[:, None]
+                ret_input_ids = torch.cat([ret_input_ids, next_tokens[:, None]], dim=-1)
+            else:
+                input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -2377,8 +2398,18 @@ class GenerationMixin:
             if stopping_criteria(input_ids, scores):
                 this_peer_finished = True
 
+            # extra stop condition for kvquant
+            posid = model_inputs['position_ids']
+            if posid.shape[-1] == 1:
+                posid = posid.flatten().item()
+                if max_length <= posid + 1:
+                    this_peer_finished = True
+
             if this_peer_finished and not synced_gpus:
                 break
+
+        if kvquant:
+            input_ids = ret_input_ids
 
         if streamer is not None:
             streamer.end()
@@ -2420,6 +2451,7 @@ class GenerationMixin:
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: bool = False,
+        kvquant: bool = False,
         streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
@@ -2578,6 +2610,10 @@ class GenerationMixin:
         # keep track of which sequences are already finished
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
+        # KVQuant
+        first_iter = False
+        ret_input_ids = input_ids
+
         this_peer_finished = False  # used by synced_gpus only
         # auto-regressive generation
         while True:
@@ -2592,7 +2628,8 @@ class GenerationMixin:
                     break
 
             # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            model_inputs = self.prepare_inputs_for_generation(input_ids, kvquant=(first_iter and kvquant), **model_kwargs)
+            first_iter = True
 
             # forward pass to get next token
             outputs = self(
@@ -2640,7 +2677,12 @@ class GenerationMixin:
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
             # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if kvquant:
+                input_ids = next_tokens[:, None]
+                ret_input_ids = torch.cat([ret_input_ids, next_tokens[:, None]], dim=-1)
+            else:
+                input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -2661,8 +2703,18 @@ class GenerationMixin:
             if stopping_criteria(input_ids, scores):
                 this_peer_finished = True
 
+            # extra stop condition for kvquant
+            posid = model_inputs['position_ids']
+            if posid.shape[-1] == 1:
+                posid = posid.flatten().item()
+                if max_length <= posid + 1:
+                    this_peer_finished = True
+
             if this_peer_finished and not synced_gpus:
                 break
+
+        if kvquant:
+            input_ids = ret_input_ids
 
         if streamer is not None:
             streamer.end()

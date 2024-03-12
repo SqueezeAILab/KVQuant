@@ -17,16 +17,22 @@ import transformers
 import pickle
 import json
 
-def get_model(model):
+def get_model(model, seqlen, maxseqlen, bits, include_sparse, first_few_fp16):
     import torch
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(model)
+    config.first_few_fp16 = first_few_fp16
+    config.maxseqlen = maxseqlen
+    config.abits = bits
+    config.include_sparse = include_sparse
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(model)
-    model.seqlen = 2048
+    model = AutoModelForCausalLM.from_pretrained(model, config=config, torch_dtype=torch.half, use_flash_attention_2=True, device_map="cpu")
+    model.seqlen = seqlen
     return model
 
 # function for benchmarking runtime
@@ -110,7 +116,7 @@ if __name__ == '__main__':
         type=int, default=0, help='Seed for sampling the calibration data.'
     )
     parser.add_argument(
-        '--abits', type=int, default=16, choices=[4, 16],
+        '--abits', type=int, default=16, choices=[2, 3, 4, 16],
         help='#bits to use for quantization; use 16 for evaluating base model.'
     )
     parser.add_argument(
@@ -124,6 +130,14 @@ if __name__ == '__main__':
     parser.add_argument(
         '--torch_profile', action='store_true',
         help='Use CUDA profiling tool for timing runs.'
+    )
+    parser.add_argument(
+        '--seqlen', type=int, default=2048,
+        help='Used by dataloader'
+    )
+    parser.add_argument(
+        '--maxseqlen', type=int, default=-1,
+        help='Used to set KV cache size'
     )
 
     # arguments for quantization
@@ -139,12 +153,20 @@ if __name__ == '__main__':
         '--sparsity-threshold', type=float, default=1,
         help='Outlier percentile.'
     )
+    parser.add_argument(
+        '--first_few_fp16', type=int, default=0,
+        help='Store first few tokens separately in fp16'
+    )
+    parser.add_argument(
+        '--norm', action='store_true',
+        help='Whether to use q-norm.'
+    )
 
     DEV = torch.device('cuda:0')
 
     args = parser.parse_args()
 
-    model = get_model(args.model)
+    model = get_model(args.model, args.seqlen, args.maxseqlen, args.abits, args.include_sparse, args.first_few_fp16)
     model.eval()
     model.model.set_devices()
 
@@ -154,22 +176,26 @@ if __name__ == '__main__':
 
     layers = model.model.layers
     print('Load quantizers.')
-    with open(args.quantizer_path, 'rb') as handle:
-        quantizers = pickle.load(handle)
+    if args.abits != 16:
+        with open(args.quantizer_path, 'rb') as handle:
+            quantizers = pickle.load(handle)
 
     if args.benchmark:
         # load lookup table + outlier thresholds
-        for k in quantizers.keys():
-            if '.lut' in k:
-                continue
-            print('k: ', k)
-            ln = int(k.split('.')[-3]) # layer number
-            q = quantizers[k]
+        if args.abits != 16:
+            for k in quantizers.keys():
+                if '.lut' in k:
+                    continue
+                print('k: ', k)
+                ln = int(k.split('.')[-3]) # layer number
+                q = quantizers[k]
 
-            if "k_proj" in k:
-                layers[ln].self_attn.kcache.load_lookup_table(q, args.include_sparse, args.sparsity_threshold)
-            elif "v_proj" in k:
-                layers[ln].self_attn.vcache.load_lookup_table(q, args.include_sparse, args.sparsity_threshold)
+                if "k_proj" in k:
+                    layers[ln].self_attn.kcache.reset()
+                    layers[ln].self_attn.kcache.load_lookup_table(q, args.include_sparse, args.sparsity_threshold, args.norm)
+                elif "v_proj" in k:
+                    layers[ln].self_attn.vcache.reset()
+                    layers[ln].self_attn.vcache.load_lookup_table(q, args.include_sparse, args.sparsity_threshold, args.norm)
 
         model = model.half()
         model = model.to(DEV)
