@@ -7,7 +7,7 @@ def parse_model(model):
         # TODO: for now, we assume that if it's not opt, it's llama variant
         # additional rules should be added to support other models
         model_type = "llama"
-    print(f'Model type : {model_type}')
+    #print(f'Model type : {model_type}')
 
     return model_type
 
@@ -46,7 +46,6 @@ def get_model(model, model_type):
     if model_type == 'opt':
         return model.model.decoder
     elif model_type == 'dbrx':
-        print(model)
         return model.transformer
     else:
         assert model_type == 'llama'

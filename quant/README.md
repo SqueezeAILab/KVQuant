@@ -19,10 +19,10 @@ pip install -e .
 pip install flash-attn --no-build-isolation
 ```
 
-3. (Optional) For DBRX evaluation, please install transformers from source in the dbrx repository.
+3. (Optional) For DBRX evaluation, please install transformers from source in the dbrx directory.
 
 ---
-## Scripts (WIP)
+## Scripts for evaluating LLaMA / Mistral Models
 
 ### llama_simquant.py - used for simulated quantization experiments
 
@@ -43,13 +43,13 @@ CUDA_VISIBLE_DEVICES=0 python eval_passkey_simquant.py --path_to_ckp <path-to-ll
 
 ---
 
-## Model Checkpoints
+## DBRX Results
 
 Quantized checkpoints are provided for the DBRX-Base and DBRX-Instruct models. Perplexity evaluation on Wikitext-2 is included below for both DBRX-Base and DBRX-Instruct using KVQuant (input length 2k). 
 
 These checkpoints leverage Attention-Sink Aware Quantization, so the `--first_few_fp16 1` argument must be used when running perplexity evaluation. Additionally, for the 2-bit checkpoints, Q-Norm is used, so the `--norm` argument should be passed in.
 
-Example evaluation run:
+Example DBRX evaluation run:
 
 ```
 CUDA_VISIBLE_DEVICES=0 python dbrx_simquant.py databricks/dbrx-base --abits 4 --nsamples 16 --seqlen 2048 --nuq --include_sparse --sparsity-threshold 0.99 --quantizer-path <path-to-quantizer-pickle-file> --first_few_fp16 1 ;
