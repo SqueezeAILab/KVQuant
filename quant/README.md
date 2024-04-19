@@ -43,7 +43,7 @@ CUDA_VISIBLE_DEVICES=0 python eval_passkey_simquant.py --path_to_ckp <path-to-ll
 
 ---
 
-# Model Checkpoints
+## Model Checkpoints
 
 Quantized checkpoints are provided for the DBRX-Base and DBRX-Instruct models. Perplexity evaluation on Wikitext-2 is included below for both DBRX-Base and DBRX-Instruct using KVQuant (input length 2k). 
 
