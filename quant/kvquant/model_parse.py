@@ -1,6 +1,8 @@
 def parse_model(model):
     if "opt" in str(type(model)).lower():
         model_type = "opt"
+    elif "dbrx" in str(type(model)).lower():
+        model_type = "dbrx"
     else:
         # TODO: for now, we assume that if it's not opt, it's llama variant
         # additional rules should be added to support other models
@@ -43,6 +45,9 @@ def get_sequential(model_type):
 def get_model(model, model_type):
     if model_type == 'opt':
         return model.model.decoder
+    elif model_type == 'dbrx':
+        print(model)
+        return model.transformer
     else:
         assert model_type == 'llama'
         return model.model
@@ -66,6 +71,8 @@ def get_embedding(model, model_type):
     _model = get_model(model, model_type)
     if model_type == "opt":
         return [_model.embed_tokens, _model.embed_positions]
+    elif model_type == "dbrx":
+        return [_model.wte]
     else:
         assert model_type == "llama"
         return [_model.embed_tokens]
@@ -74,6 +81,8 @@ def get_norm(model, model_type):
     _model = get_model(model, model_type)
     if model_type == "opt":
         return _model.final_layer_norm
+    elif model_type == "dbrx":
+        return _model.norm_f
     else:
         assert model_type == "llama"
         return _model.norm

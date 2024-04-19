@@ -19,6 +19,8 @@ pip install -e .
 pip install flash-attn --no-build-isolation
 ```
 
+3. (Optional) For DBRX evaluation, please install transformers from source in the dbrx repository.
+
 ---
 ## Scripts (WIP)
 
@@ -38,6 +40,34 @@ CUDA_VISIBLE_DEVICES=0 python llama_simquant.py <path-to-llama-7b-hf> --abits 4 
 ```
 CUDA_VISIBLE_DEVICES=0 python eval_passkey_simquant.py --path_to_ckp <path-to-llama-7b-hf> --abits 4 --simquant --quantizer-path quantizers.pickle ;
 ```
+
+---
+
+# Model Checkpoints
+
+Quantized checkpoints are provided for the DBRX-Base and DBRX-Instruct models. Perplexity evaluation on Wikitext-2 is included below for both DBRX-Base and DBRX-Instruct using KVQuant (input length 2k). 
+
+These checkpoints leverage Attention-Sink Aware Quantization, so the `--first_few_fp16 1` argument must be used when running perplexity evaluation. Additionally, for the 2-bit checkpoints, Q-Norm is used, so the `--norm` argument should be passed in.
+
+Example evaluation run:
+
+```
+CUDA_VISIBLE_DEVICES=0 python dbrx_simquant.py databricks/dbrx-base --abits 4 --nsamples 16 --seqlen 2048 --nuq --include_sparse --sparsity-threshold 0.99 --quantizer-path <path-to-quantizer-pickle-file> --first_few_fp16 1 ;
+```
+
+### DBRX-Base
+
+| Model |  fp16 | nuq4-1% | nuq3-1% |  nuq2-1% |
+| -------- | -------- | -------- | -------- | -------- |
+| Perplexity    |  3.96 | 3.98 | 4.03 | 4.26 | 
+| Checkpoint | | [dbrx-base-nuq4-s1](https://huggingface.co/squeeze-ai-lab/dbrx-base-a4-s1) | [dbrx-base-nuq3-s1](https://huggingface.co/squeeze-ai-lab/dbrx-base-a3-s1) | [dbrx-base-nuq2-s1](https://huggingface.co/squeeze-ai-lab/dbrx-base-a2-s1) |
+
+### DBRX-Instruct
+
+| Model |  fp16 | nuq4-1% | nuq3-1% |  nuq2-1% |
+| -------- | -------- | -------- | -------- | -------- |
+| Perplexity    |  4.30 | 4.31 | 4.36 | 4.61 | 
+| Checkpoint | | [dbrx-instruct-nuq4-s1](https://huggingface.co/squeeze-ai-lab/dbrx-instruct-a4-s1) | [dbrx-instruct-nuq3-s1](https://huggingface.co/squeeze-ai-lab/dbrx-instruct-a3-s1) | [dbrx-instruct-nuq2-s1](https://huggingface.co/squeeze-ai-lab/dbrx-instruct-a2-s1) |
 
 ---
 
