@@ -93,15 +93,82 @@ M = 128 # head dim
 num_heads = 32
 head_dim = 128
 
-N = 2048 #16384 #4096 # vcache seqlen
+N = 2048 # vcache seqlen
 
 num_iters = 1000
 
-with open(f'activations.pickle', 'rb') as handle:
+with open(f'activations-seqlen{N}.pickle', 'rb') as handle:
     activations = pickle.load(handle)
 
 with open(f'quantizers.pickle', 'rb') as handle:
     quantizers = pickle.load(handle)
+
+# warmup
+warmup = True
+if warmup:
+    for l in range(0,32):
+        k_act = activations[f'self_attn.k_proj.{l}']
+        v_act = activations[f'self_attn.v_proj.{l}']
+
+        quantizer = quantizers[f'model.layers.{l}.self_attn.k_proj']
+
+        ### Q*KT operation
+        num_heads = 32
+        head_dim = 128
+        max_len = N
+        q = torch.zeros((1,num_heads,head_dim), dtype=torch.float).cuda()
+
+        maxval = torch.tensor(quantizer[0]).cuda().half().squeeze(0)
+        minval = torch.tensor(quantizer[1]).cuda().half().squeeze(0)
+        outlier_threshold_lower = minval.float()
+        outlier_threshold_upper = maxval.float()
+        offset = (maxval + minval) / 2
+        rangeval = (maxval - minval) / 2
+
+        kcache2 = torch.zeros((num_heads, head_dim // 8, max_len), dtype=torch.int).cuda()
+        lookup_table = torch.zeros((num_heads, head_dim, 2 ** 4))
+
+        # kernel is indep. of values used for signposts (note that activations are collected using the real values)
+        nf4_signposts = get_nf4_signposts(4)
+
+        for i in range(num_heads):
+            for j in range(head_dim):
+                idx = i * head_dim + j
+                sf_tmp = rangeval[idx]
+                offset_tmp = offset[idx]
+                lookup_table[i,j] = torch.tensor(nf4_signposts) * sf_tmp.item() + offset_tmp.item()
+
+        lookup_table = lookup_table.cuda()
+
+        # initialize zeropoint
+        zeropoint = (maxval + minval) / 2
+        zeropoint = zeropoint.float().cuda()
+
+        rows2 = torch.tensor([]).cuda()
+        cols2 = torch.tensor([]).cuda()
+        vals2 = torch.tensor([]).cuda()
+        start_rows = torch.tensor([]).cuda()
+
+        # code for fw pass
+        for i in range(0,num_iters):
+            newk = k_act[i]
+
+            rows2, cols2, vals2, start_rows, num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparse(
+                kcache2,
+                lookup_table,
+                newk,
+                zeropoint,
+                rows2,
+                cols2,
+                vals2,
+                start_rows,
+                outlier_threshold_lower,
+                outlier_threshold_upper,
+                i
+            )
+            num_threads = num_threads[0]
+            num_nonzeros = vals2.shape[0]
+            torch.cuda.synchronize()
 
 from torch.profiler import profile, record_function, ProfilerActivity
 with torch.profiler.profile(
@@ -158,7 +225,7 @@ activities=[
         for i in range(0,num_iters):
             newk = k_act[i]
 
-            rows2, cols2, vals2, start_rows, num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparseorig(
+            rows2, cols2, vals2, start_rows, num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparse(
                 kcache2,
                 lookup_table,
                 newk,
@@ -173,5 +240,6 @@ activities=[
             )
             num_threads = num_threads[0]
             num_nonzeros = vals2.shape[0]
+            torch.cuda.synchronize()
 
 print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))

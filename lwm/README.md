@@ -6,7 +6,7 @@ Our work, KVQuant, enables efficient and accurate long context inference using a
 
 ![Haystack](figs/haystack.png)
 
-_Haystack evaluation (input length=256k) using the 3-bit quantization scheme from KVQuant. KVQuant retains the retrieval performance of the base model, even when evaluated using long context lengths._ 
+_Haystack evaluation (input length=256k) using the 3-bit quantization scheme from KVQuant, averaged over 10 samples. KVQuant retains the retrieval performance of the base model, even when evaluated using long context lengths._ 
 
 | Model |  fp16 | nuq4-1% | nuq3-1% |  nuq2-1% |
 | -------- | -------- | -------- | -------- | -------- |

@@ -23,7 +23,7 @@ B = 32 # num heads
 M = 128 # head dim
 N = 2048 # vcache seqlen
 
-DTYPE = torch.float
+DTYPE = torch.half
 matf = torch.randn((B, N, M), device=DEV, dtype=DTYPE)
 vec = torch.randn((B, 1, M), device=DEV, dtype=DTYPE)
 mul = torch.zeros((B, 1, N), device=DEV, dtype=DTYPE)
@@ -41,6 +41,13 @@ cos = torch.randn((B, 1, M), device=DEV, dtype=DTYPE)
 sin = torch.randn((B, 1, M), device=DEV, dtype=DTYPE)
 vec1 = rotate_half(vec)
 
+# warmup
+for _ in range(COUNT):
+    v = (vec * cos) + (vec1 * sin)
+    torch.matmul(v, matf, out=mul)
+    torch.cuda.synchronize()
+
+# benchmark
 from torch.profiler import profile, record_function, ProfilerActivity
 with torch.profiler.profile(
 activities=[

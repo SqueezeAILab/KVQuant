@@ -268,8 +268,6 @@ def apply_rotary_pos_emb_query(q, cos, sin, position_ids, unsqueeze_dim=1):
 # apply RoPE to only Q here using dynamic RoPE cos/sin computation
 def apply_rotary_pos_emb_query_dynamic(q, cos, sin, position_ids, unsqueeze_dim=1):
     position_ids = position_ids.cpu()
-    # cos = cos.unsqueeze(unsqueeze_dim)
-    # sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     return q_embed
 
@@ -1092,6 +1090,10 @@ class QuantV(nn.Module):
             assert (lower_outlier_indices != None)
             maxval = upper_outlier_vals[-1]
             minval = lower_outlier_vals[-1]
+            upper_outlier_vals = upper_outlier_vals[:-1].contiguous() # when using topk(22)
+            lower_outlier_vals = lower_outlier_vals[:-1].contiguous() # when using topk(22)
+            upper_outlier_indices = upper_outlier_indices[:-1].contiguous()
+            lower_outlier_indices = lower_outlier_indices[:-1].contiguous()
             offset = (maxval + minval) / 2
             sf = (maxval - minval) / 2
             outlier_threshold_lower = minval
@@ -1308,8 +1310,12 @@ class QuantV(nn.Module):
             assert (upper_outlier_indices != None)
             assert (lower_outlier_vals != None)
             assert (lower_outlier_indices != None)
-            maxval = upper_outlier_vals[:,-1]
-            minval = lower_outlier_vals[:,-1]
+            maxval = upper_outlier_vals[:,-1].contiguous()
+            minval = lower_outlier_vals[:,-1].contiguous()
+            upper_outlier_vals = upper_outlier_vals[:,:-1].contiguous() # when using topk(22)
+            lower_outlier_vals = lower_outlier_vals[:,:-1].contiguous() # when using topk(22)
+            upper_outlier_indices = upper_outlier_indices[:,:-1].contiguous()
+            lower_outlier_indices = lower_outlier_indices[:,:-1].contiguous()
             offset = (maxval + minval) / 2
             sf = (maxval - minval) / 2
             outlier_threshold_lower = minval
@@ -1530,7 +1536,7 @@ class LlamaAttention(nn.Module):
 
             with torch.cuda.stream(s2):
                 v = v.cpu() # asynchronous mem copy, CPU can now run ahead
-                threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 1
+                threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 2
                 upper_outlier_vals,upper_outlier_indices = torch.topk(v,threshold_k)
                 lower_outlier_vals,lower_outlier_indices = torch.topk(v,threshold_k,largest=False)
                 upper_outlier_vals = upper_outlier_vals.cuda()
@@ -1546,7 +1552,7 @@ class LlamaAttention(nn.Module):
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
             # block topK on GPU
-            threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 1
+            threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 2
             upper_outlier_vals,upper_outlier_indices = torch.topk(v,threshold_k,dim=-1)
             lower_outlier_vals,lower_outlier_indices = torch.topk(v,threshold_k,dim=-1,largest=False)
 
@@ -1805,7 +1811,7 @@ class LlamaFlashAttention2(LlamaAttention):
 
             with torch.cuda.stream(s2):
                 v = v.cpu() # asynchronous mem copy, CPU can now run ahead
-                threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 1
+                threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 2
                 upper_outlier_vals,upper_outlier_indices = torch.topk(v,threshold_k)
                 lower_outlier_vals,lower_outlier_indices = torch.topk(v,threshold_k,largest=False)
                 upper_outlier_vals = upper_outlier_vals.cuda()
@@ -1821,7 +1827,7 @@ class LlamaFlashAttention2(LlamaAttention):
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
             # block topK on GPU
-            threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 1
+            threshold_k = int(((1-self.kcache.sparsity_threshold) / 2) * self.hidden_size) + 2
             upper_outlier_vals,upper_outlier_indices = torch.topk(v,threshold_k,dim=-1)
             lower_outlier_vals,lower_outlier_indices = torch.topk(v,threshold_k,dim=-1,largest=False)
 

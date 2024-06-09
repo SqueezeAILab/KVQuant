@@ -94,16 +94,62 @@ M = 128 # head dim
 num_heads = 32
 head_dim = 128
 
-N = 2048 #16384 #4096 # vcache seqlen
+N = 2048  # vcache seqlen
 max_len = N
 
 num_iters = 1000
 
-with open(f'activations.pickle', 'rb') as handle:
+with open(f'activations-seqlen{N}.pickle', 'rb') as handle:
     activations = pickle.load(handle)
 
 with open(f'quantizers.pickle', 'rb') as handle:
     quantizers = pickle.load(handle)
+
+warmup = True
+if warmup:
+    for l in range(0,32):
+
+        k_act = activations[f'self_attn.k_proj.{l}']
+        v_act = activations[f'self_attn.v_proj.{l}']
+
+        quantizer = quantizers[f'model.layers.{l}.self_attn.v_proj']
+
+        ### Score * V ###
+        hidden_size = 4096
+        threshold_k = int(((1-0.99) / 2) * hidden_size) + 1
+
+        rows2 = torch.tensor([]).cuda()
+        cols2 = torch.tensor([]).cuda()
+        vals2 = torch.tensor([]).cuda()
+        start_cols = torch.tensor([]).cuda()
+        vcache2 = torch.zeros((num_heads, max_len // 8, head_dim), dtype=torch.int).cuda()
+        scalingfactor = torch.zeros((N,), dtype=torch.float).cuda()
+        zeropoint = torch.zeros((N,), dtype=torch.float).cuda()
+
+        nf4_signposts = get_nf4_signposts(4)
+
+        for i in range(0,num_iters):
+            newv = v_act[i % v_act.shape[0]].float()
+
+            sorted_v,_ = newv.sort()
+            minval = sorted_v[threshold_k]
+            maxval = sorted_v[-threshold_k]
+            offset = (maxval + minval) / 2
+            sf = (maxval - minval) / 2
+
+            lookup_table = torch.tensor(nf4_signposts).float().cuda() # * sf.float().item() + offset.float().item()
+            zeropoint_tmp = lookup_table[7] * sf.float().item() + offset.float().item()
+
+            scalingfactor[i] = sf.float().item()
+            zeropoint[i] = offset.float().item()
+
+            outlier_threshold_lower = minval
+            outlier_threshold_upper = maxval
+
+            rows2, cols2, vals2, start_cols, num_threads, outlier_count = quant_cuda.vecquant4appendvecVsparse(vcache2, lookup_table, newv, zeropoint_tmp, rows2, cols2, vals2, start_cols, outlier_threshold_lower, outlier_threshold_upper, i)
+            num_threads = num_threads[0]
+            num_nonzeros = vals2.shape[0]
+            torch.cuda.synchronize()
 
 from torch.profiler import profile, record_function, ProfilerActivity
 with torch.profiler.profile(
@@ -114,6 +160,7 @@ activities=[
 ) as p:
 
     for l in range(0,32):
+
         k_act = activations[f'self_attn.k_proj.{l}']
         v_act = activations[f'self_attn.v_proj.{l}']
 
@@ -123,18 +170,18 @@ activities=[
         hidden_size = 4096
         threshold_k = int(((1-0.99) / 2) * hidden_size) + 1
 
-        lookup_table2 = torch.zeros((N, 2 ** 4)).cuda()
         rows2 = torch.tensor([]).cuda()
         cols2 = torch.tensor([]).cuda()
         vals2 = torch.tensor([]).cuda()
         start_cols = torch.tensor([]).cuda()
-        vcache2 = torch.zeros((num_heads, head_dim // 8, max_len), dtype=torch.int).cuda()
+        vcache2 = torch.zeros((num_heads, max_len // 8, head_dim), dtype=torch.int).cuda()
+        scalingfactor = torch.zeros((N,), dtype=torch.float).cuda()
+        zeropoint = torch.zeros((N,), dtype=torch.float).cuda()
 
-        # kernel is indep. of values used for signposts (note that activations are collected using the real values)
         nf4_signposts = get_nf4_signposts(4)
 
-        for i in range(0,N):
-            newv = v_act[i].float()
+        for i in range(0,num_iters):
+            newv = v_act[i % v_act.shape[0]].float()
 
             sorted_v,_ = newv.sort()
             minval = sorted_v[threshold_k]
@@ -142,15 +189,18 @@ activities=[
             offset = (maxval + minval) / 2
             sf = (maxval - minval) / 2
 
-            lookup_table = torch.tensor(nf4_signposts).float() * sf.float().item() + offset.float().item()
-            lookup_table2[i] = lookup_table
-            zeropoint = lookup_table[7]
+            lookup_table = torch.tensor(nf4_signposts).float().cuda() # * sf.float().item() + offset.float().item()
+            zeropoint_tmp = lookup_table[7] * sf.float().item() + offset.float().item()
 
-            outlier_threshold_lower = lookup_table[0]
-            outlier_threshold_upper = lookup_table[-1]
+            scalingfactor[i] = sf.float().item()
+            zeropoint[i] = offset.float().item()
 
-            rows2, cols2, vals2, start_cols, num_threads, outlier_count = quant_cuda.vecquant4appendvecVsparseorig(vcache2, lookup_table2, newv, zeropoint, rows2, cols2, vals2, start_cols, outlier_threshold_lower, outlier_threshold_upper, i)
+            outlier_threshold_lower = minval
+            outlier_threshold_upper = maxval
+
+            rows2, cols2, vals2, start_cols, num_threads, outlier_count = quant_cuda.vecquant4appendvecVsparse(vcache2, lookup_table, newv, zeropoint_tmp, rows2, cols2, vals2, start_cols, outlier_threshold_lower, outlier_threshold_upper, i)
             num_threads = num_threads[0]
             num_nonzeros = vals2.shape[0]
+            torch.cuda.synchronize()
 
 print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))

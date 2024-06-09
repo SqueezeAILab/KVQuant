@@ -21,12 +21,20 @@ DEV = torch.device('cuda:0')
 
 B = 32 # num heads
 M = 128 # head dim
-N = 2048 #4096 # kcache seqlen
+N = 2048 # kcache seqlen
 
 benchmark_K = False # default is benchmark V
 
-DTYPE = torch.float
+DTYPE=torch.half
 
+# warmup
+COUNT = 1000
+random_tensor = torch.rand((B,M,N), dtype=DTYPE).to(DEV) #4096, 2048
+vec = torch.rand((B,N,1), dtype=DTYPE).to(DEV) #32,2048
+for _ in range(COUNT):
+    mul = torch.matmul(random_tensor, vec).to(DEV)
+
+# benchmark
 from torch.profiler import profile, record_function, ProfilerActivity
 with torch.profiler.profile(
 activities=[
@@ -37,7 +45,7 @@ activities=[
 
     if benchmark_K:
         random_tensor = torch.rand((B,N,M), dtype=DTYPE).to(DEV)
-        vec = torch.rand((B,M,1)).to(DEV)
+        vec = torch.rand((B,M,1), dtype=DTYPE).to(DEV)
 
         COUNT = 1000
         for _ in range(COUNT):
@@ -45,7 +53,7 @@ activities=[
             torch.cuda.synchronize()
     else:
         random_tensor = torch.rand((B,M,N), dtype=DTYPE).to(DEV) #4096, 2048
-        vec = torch.rand((B,N,1)).to(DEV) #32,2048
+        vec = torch.rand((B,N,1), dtype=DTYPE).to(DEV) #32,2048
 
         COUNT = 1000
         for _ in range(COUNT):

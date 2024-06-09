@@ -4,11 +4,12 @@ import time
 
 l1 = 4096
 l2 = 4096
-tensor11 = torch.randn(4096,4096).cuda()
-tensor12 = torch.randn(4096,4096).cuda()
-tensor13 = torch.randn(4096,4096).cuda()
-tensor2 = torch.randn(4096).cuda()
-tensor3 = torch.randn(l2).cuda()
+
+tensor11 = torch.randn(4096,4096).half().cuda()
+tensor12 = torch.randn(4096,4096).half().cuda()
+tensor13 = torch.randn(4096,4096).half().cuda()
+tensor2 = torch.randn(4096).half().cuda()
+tensor3 = torch.randn(l2).half().cuda()
 
 COUNT = 1000
 

@@ -202,7 +202,6 @@ class LLMNeedleHaystackTester:
             return (result['context_length'], result['depth_percent'], result['seed'])
 
         results = []
-        results2 = []
         completed = set()
         def exists(fname):
             return os.path.exists(fname)
@@ -278,7 +277,7 @@ class LLMNeedleHaystackTester:
                             layers[ln].self_attn.vcache.reset()
 
                 # get response as a string
-                outs = [self.enc.decode(outs[0])]
+                outs = [self.enc.decode(outs[0,prompt_ind_tensor.shape[1]:])]
 
                 # append results to text file
                 for j, (context, out) in enumerate(zip(contexts_i, outs)):
@@ -292,15 +291,8 @@ class LLMNeedleHaystackTester:
                         'correct': context['needle_rnd_number'] in out,
                         'seed': context['seed'],
                     })
-                    results2.append({
-                        'context_length': context['context_length'],
-                        'depth_percent': context['depth_percent'],
-                        'correct': context['needle_rnd_number'] in out
-                    })
                 with open(self.output_file, 'w') as f:
                     json.dump(results, f)
-                with open(self.output_file+'.tmp', 'w') as f:
-                    json.dump(results2, f)
                 pbar.update(len(contexts_i))
             pbar.close()
         print('elapsed', time.time() - start)
@@ -341,16 +333,17 @@ if __name__ == "__main__":
         '--first_few_fp16', type=int, default=0,
         help='Number of initial tokens to store in fp16.'
     )
+    parser.add_argument("--haystack_file", type=str, default="/home/chooper/LWM/pg19.json")
 
     args = parser.parse_args()
 
-    haystack_file="/home/chooper/LWM/pg19.json"
+    haystack_file=args.haystack_file
     max_tokens_per_batch=args.maxseqlen
     output_file="results.json"
-    context_lengths_min=1024
-    context_lengths_max=args.maxseqlen-1024
+    context_lengths_min=1000
+    context_lengths_max=args.maxseqlen-1000
     n_context_length_intervals=10
-    n_document_depth_intervals=10
+    n_document_depth_intervals=2 #10
     n_rounds=3
 
     # load local model

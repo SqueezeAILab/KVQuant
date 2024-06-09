@@ -240,7 +240,6 @@ if __name__ == '__main__':
     model = get_model_longseqlen(args.model, args.seqlen, args.maxseqlen)
     model = model.half()
     model.eval()
-    model.model.set_devices()
 
     dataloader, testloader = get_loaders(
         "wikitext2", nsamples=args.nsamples, seed=0, model=args.model, seqlen=model.seqlen

@@ -8,7 +8,6 @@ TLDR: KVQuant addresses the memory bottleneck with long context length inference
 - **Per-channel, Pre-RoPE** Key quantization to better match the outlier channels in Keys
 - Non-Uniform Quantization (**NUQ**) to better represent the non-uniform activations
 - **Dense-and-Sparse Quantization** to mitigate the impacts of numerical outliers on quantization difficulty
-- **Q-Norm** to mitigate distribution shift at ultra low precisions (eg. 2-bit)
 
 KVQuant enables serving the **LLaMA-7B model with 1M context length on a single A100-80GB GPU**, or even the **LLaMA-7B model with 10M context length on an 8-GPU system** 🔥
 
@@ -46,6 +45,7 @@ The codebase contains three different subfolders, each of which has its own READ
 - `quant` - codebase for running simulated quantization + eval experiments (need to first compute fisher information)
 - `deployment` - codebase for running efficient inference with compressed vectors (need to first get quantizers from quant step)
 - `lwm` - code for running inference with and evaluating quantized LWM models
+- `benchmarking` - code for benchmarking kernels (need to first get quantizers from quant step)
 
 To reproduce the perplexity numbers reported in the paper, run `gradients` and then `quant`.
 
@@ -53,9 +53,8 @@ To reproduce the perplexity numbers reported in the paper, run `gradients` and t
 
 ### Roadmap:
 - ~~add deployment code~~
-- multi-GPU evaluation environment for long sequence length evaluation with simulated quantization
-- unify environments to simplify installation
-- optimized kernels for A100
+- ~~optimized kernels~~
+- merging optimized kernels with end-to-end inference deployment code
 - additional evaluation on long context lengths + different downstream tasks
 - multi-GPU inference
 

@@ -94,12 +94,11 @@ M = 128 # head dim
 num_heads = 32
 head_dim = 128
 
-N = 2048 #4096 # vcache seqlen
-max_len = N
+N = 2048 # vcache seqlen
 
 num_iters = 1000
 
-with open(f'activations.pickle', 'rb') as handle:
+with open(f'activations-seqlen{N}.pickle', 'rb') as handle:
     activations = pickle.load(handle)
 
 with open(f'quantizers.pickle', 'rb') as handle:
@@ -110,55 +109,80 @@ for l in range(0,32):
     k_act = activations[f'self_attn.k_proj.{l}']
     v_act = activations[f'self_attn.v_proj.{l}']
 
-    quantizer = quantizers[f'model.layers.{l}.self_attn.v_proj']
+    quantizer = quantizers[f'model.layers.{l}.self_attn.k_proj']
 
-    ### Score * V ###
-    hidden_size = 4096
-    threshold_k = int(((1-0.99) / 2) * hidden_size) + 1
+    ### Q*KT operation
+    num_heads = 32
+    head_dim = 128
+    max_len = N
+    q = torch.zeros((1,num_heads,head_dim), dtype=torch.float).cuda()
 
-    lookup_table2 = torch.zeros((N, 2 ** 4)).cuda()
-    rows2 = torch.tensor([]).cuda()
-    cols2 = torch.tensor([]).cuda()
-    vals2 = torch.tensor([]).cuda()
-    start_cols = torch.tensor([]).cuda()
-    vcache2 = torch.zeros((num_heads, head_dim // 8, max_len), dtype=torch.int).cuda()
+    maxval = torch.tensor(quantizer[0]).cuda().half().squeeze(0)
+    minval = torch.tensor(quantizer[1]).cuda().half().squeeze(0)
+    outlier_threshold_lower = minval.float()
+    outlier_threshold_upper = maxval.float()
+    offset = (maxval + minval) / 2
+    rangeval = (maxval - minval) / 2
+
+    kcache2 = torch.zeros((num_heads, head_dim // 8, max_len), dtype=torch.int).cuda()
+    lookup_table = torch.zeros((num_heads, head_dim, 2 ** 4))
 
     nf4_signposts = get_nf4_signposts(4)
 
+    for i in range(num_heads):
+        for j in range(head_dim):
+            idx = i * head_dim + j
+            sf_tmp = rangeval[idx]
+            offset_tmp = offset[idx]
+            lookup_table[i,j] = torch.tensor(nf4_signposts) * sf_tmp.item() + offset_tmp.item()
+
+    lookup_table = lookup_table.cuda()
+
+    # initialize zeropoint
+    zeropoint = (maxval + minval) / 2
+    zeropoint = zeropoint.float().cuda()
+    scalingfactor = rangeval.float().cuda()
+
+    rows2 = torch.tensor([]).cuda()
+    cols2 = torch.tensor([]).cuda()
+    vals2 = torch.tensor([]).cuda()
+    start_rows = torch.tensor([]).cuda()
+
+    # code for fw pass
     for i in range(0,N):
-        newv = v_act[i].float()
+        newk = k_act[i % k_act.shape[0]].float()
 
-        sorted_v,_ = newv.sort()
-        minval = sorted_v[threshold_k]
-        maxval = sorted_v[-threshold_k]
-        offset = (maxval + minval) / 2
-        sf = (maxval - minval) / 2
-
-        lookup_table = torch.tensor(nf4_signposts).float() * sf.float().item() + offset.float().item()
-        lookup_table2[i] = lookup_table
-        zeropoint = lookup_table[7]
-
-        # can just use upper / lower when using NF for benchmarking
-        # otherwise we need to use minval / maxval obtained from sorting
-        outlier_threshold_lower = lookup_table[0]
-        outlier_threshold_upper = lookup_table[-1]
-
-        rows2, cols2, vals2, start_cols, num_threads, outlier_count = quant_cuda.vecquant4appendvecVsparseorig(vcache2, lookup_table2, newv, zeropoint, rows2, cols2, vals2, start_cols, outlier_threshold_lower, outlier_threshold_upper, i)
+        rows2, cols2, vals2, start_rows, num_threads, outlier_count = quant_cuda.vecquant4appendvecKsparse(
+            kcache2,
+            lookup_table,
+            newk,
+            zeropoint,
+            rows2,
+            cols2,
+            vals2,
+            start_rows,
+            outlier_threshold_lower,
+            outlier_threshold_upper,
+            i
+        )
         num_threads = num_threads[0]
         num_nonzeros = vals2.shape[0]
 
-    #D+S matvec operation
-    score = torch.zeros((1, num_heads, N), dtype=torch.float).cuda()
-    mul = torch.zeros((1, num_heads, head_dim), dtype=torch.float).cuda()
+    q = torch.ones((1,num_heads,head_dim), dtype=torch.float).cuda()
+    mul = torch.zeros((1, num_heads, N), dtype=torch.float).cuda() #TODO: support longer q seqlens
 
-    d[f'layer{l} score'] = score
-    d[f'layer{l} vcache2'] = vcache2
+    lookup_table = torch.tensor(nf4_signposts).float().cuda()
+
+    d[f'layer{l} q'] = q
+    d[f'layer{l} kcache2'] = kcache2
     d[f'layer{l} mul'] = mul
-    d[f'layer{l} lookup_table2'] = lookup_table2
+    d[f'layer{l} lookup_table'] = lookup_table
+    d[f'layer{l} scalingfactor'] = scalingfactor
+    d[f'layer{l} zeropoint'] = zeropoint
     d[f'layer{l} N'] = N
     d[f'layer{l} rows2'] = rows2
     d[f'layer{l} cols2'] = cols2
-    d[f'layer{l} start_cols'] = start_cols
+    d[f'layer{l} start_rows'] = start_rows
     d[f'layer{l} vals2'] = vals2
     d[f'layer{l} num_threads'] = num_threads
     d[f'layer{l} num_nonzeros'] = num_nonzeros
@@ -166,21 +190,24 @@ for l in range(0,32):
 # warmup
 j = 0
 for i in range(0,num_iters):
-    quant_cuda.vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_orig(
-        d[f'layer{j} score'],
-        d[f'layer{j} vcache2'],
+    quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused(
+        d[f'layer{j} q'],
+        d[f'layer{j} kcache2'],
         d[f'layer{j} mul'],
-        d[f'layer{j} lookup_table2'],
+        d[f'layer{j} lookup_table'],
+        d[f'layer{j} scalingfactor'],
+        d[f'layer{j} zeropoint'],
         d[f'layer{j} N'],
         d[f'layer{j} rows2'],
         d[f'layer{j} cols2'],
-        d[f'layer{j} start_cols'],
+        d[f'layer{j} start_rows'],
         d[f'layer{j} vals2'],
         d[f'layer{j} N'],
         d[f'layer{j} num_threads'],
-        d[f'layer{j} num_nonzeros']
+        d[f'layer{j} num_nonzeros'],
+        10000, # rope theta
+        0 # pos offset (for first few tokens in fp16)
     )
-
 
 from torch.profiler import profile, record_function, ProfilerActivity
 with torch.profiler.profile(
@@ -191,18 +218,23 @@ activities=[
 ) as p:
     for j in range(0,32):
         for i in range(0,num_iters):
-            quant_cuda.vecquant4matmul_nuq_perchannel_transposed_mha_batched_fused_opt2_orig(
-                d[f'layer{j} score'],
-                d[f'layer{j} vcache2'],
+            quant_cuda.vecquant4matmul_nuq_perchannel_transposed_rope_mha_batched_fused(
+                d[f'layer{j} q'],
+                d[f'layer{j} kcache2'],
                 d[f'layer{j} mul'],
-                d[f'layer{j} lookup_table2'],
+                d[f'layer{j} lookup_table'],
+                d[f'layer{j} scalingfactor'],
+                d[f'layer{j} zeropoint'],
                 d[f'layer{j} N'],
                 d[f'layer{j} rows2'],
                 d[f'layer{j} cols2'],
-                d[f'layer{j} start_cols'],
+                d[f'layer{j} start_rows'],
                 d[f'layer{j} vals2'],
                 d[f'layer{j} N'],
                 d[f'layer{j} num_threads'],
-                d[f'layer{j} num_nonzeros']
+                d[f'layer{j} num_nonzeros'],
+                10000, # rope theta
+                0 # pos offset (for first few tokens in fp16)
             )
+            torch.cuda.synchronize()
 print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
