@@ -29,13 +29,12 @@ To further improve our methodology for supporting long context length inference,
 - `Parallel topK support on GPU and kernels for parallel prompt processing` - we have augmented our open-source support with additional kernels to perform parallel packing with multiple input tokens, and also modified our inference code to utilize the GPU for parallel topK when appending many value tokens in parallel.
 - `Capping Key Outliers` - we have added support for running both calibration and inference with a fixed number of outliers per token for keys. This allows us to design more efficient kernels, since there is a maximum number of outliers per token for both keys and values, and it makes memory allocation easier for our method since we can allocate fixed-size memory for each key. 
 - `Attention Sink-Aware Quantization` - based on the insight from the [Attention Sink](https://arxiv.org/abs/2309.17453) paper that the model concentrates its attention on the first token, we have added support during both calibration and inference for leaving a small number of initial keys and values (eg. 5) in fp16. This can allow for significant performance gains, and was also introduced as a method for improving quantization performance in another concurrent work [IntactKV](https://arxiv.org/abs/2403.01241).
-More detailed evaluation and analysis for these improvements will be added to the arxiv preprint shortly!
 
 
 ---
 ## Installation
 
-The codebase contains three different subfolders, each of which has its own README file with instructions that you can follow for installing the required environment for that step.
+The codebase contains five subfolders, each of which has its own README file with instructions that you can follow for installing the required environment for that step.
 
 ---
 
@@ -54,9 +53,8 @@ To reproduce the perplexity numbers reported in the paper, run `gradients` and t
 ### Roadmap:
 - ~~add deployment code~~
 - ~~optimized kernels~~
-- merging optimized kernels with end-to-end inference deployment code
-- additional evaluation on long context lengths + different downstream tasks
-- multi-GPU inference
+- merge optimized kernels with updated end-to-end inference deployment code
+- add scripts for running additional long context length evaluation
 
 ---
 
